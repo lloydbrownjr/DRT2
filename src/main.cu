@@ -2,8 +2,8 @@
 #include <time.h>
 #include <float.h>
 #include <curand_kernel.h>
-#include "vec3.h"
-#include "ray.h"
+#include "../common/vec3.h"
+#include "../common/ray.h"
 #include "sphere.h"
 #include "hitable_list.h"
 #include "camera.h"
@@ -145,6 +145,22 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
     delete *d_camera;
 }
 
+void write_fb(vec3 *fb, int nx, int ny, int max_x, int max_y) {
+    FILE *f = fopen("output.ppm", "w");
+    fprintf(f, "P3\n%d %d\n255\n", max_x, max_y);
+    for(int j=0; j < max_y; j++) {
+        for(int i=0; i < max_x; i++) {
+            vec3 col = fb[j*max_x + i];
+            int ir = int(255.99*col[0]);
+            int ig = int(255.99*col[1]);
+            int ib = int(255.99*col[2]);
+            fprintf(f, "%d %d %d ", ir, ig, ib);
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
 int main() {
     int nx = 1200;
     int ny = 800;
@@ -201,16 +217,7 @@ int main() {
     std::cerr << "took " << timer_seconds << " seconds.\n";
 
     // Output FB as Image
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
-    for (int j = ny-1; j >= 0; j--) {
-        for (int i = 0; i < nx; i++) {
-            size_t pixel_index = j*nx + i;
-            int ir = int(255.99*fb[pixel_index].r());
-            int ig = int(255.99*fb[pixel_index].g());
-            int ib = int(255.99*fb[pixel_index].b());
-            std::cout << ir << " " << ig << " " << ib << "\n";
-        }
-    }
+    write_fb(fb, nx, ny, nx, ny);
 
     // clean up
     checkCudaErrors(cudaDeviceSynchronize());

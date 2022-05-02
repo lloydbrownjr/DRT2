@@ -3,7 +3,7 @@
 
 struct hit_record;
 
-#include "ray.h"
+#include "../common/ray.h"
 #include "hitable.h"
 
 
