@@ -14,7 +14,7 @@ if (NOT "${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
             "module swap ${Prg-${CMAKE_C_COMPILER_ID}} PrgEnv-gnu")
 endif ()
 
-add_executable(cudart src/main.cu src/camera.h src/hitable.h src/hitable_list.h src/material.h common/ray.h src/sphere.h common/vec3.h)
+add_executable(cudart src/main.cu src/camera.h src/hitable.h src/hitable_list.h src/material.h src/cuda_errors.h common/ray.h src/sphere.h common/vec3.h common/options.h)
 target_compile_features(cudart PRIVATE cxx_std_11)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_60")
 
