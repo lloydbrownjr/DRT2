@@ -20,3 +20,4 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_60")
 
 # Copy the job scripts
 configure_file(job-rt job-rt COPYONLY)
+configure_file(job-rt-bench job-rt-bench COPYONLY)

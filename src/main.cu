@@ -286,7 +286,8 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     }
     stop = clock();
     double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
-    std::cerr << "took " << timer_seconds << " seconds.\n";
+    std::cerr << "took " << timer_seconds << " seconds to generate " << num_frames_to_render << " frames.\n";
+    std::cerr << "Average FPS: " << (double)num_frames_to_render / timer_seconds << "\n";
 
     // Output frame_buffer as Image
     write_frame_buffer(frame_buffer, image_width, image_height, image_width, image_height);
