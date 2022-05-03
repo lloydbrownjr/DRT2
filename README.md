@@ -12,6 +12,11 @@ make
 ```
 
 ## Running
+To run the basic frame generation test
 ```
 sbatch job-rt
+```
+To benchmark frame generation throughput
+```
+sbatch job-rt-bench
 ```
