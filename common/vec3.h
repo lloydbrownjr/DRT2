@@ -5,8 +5,11 @@
 #include <stdlib.h>
 #include <iostream>
 
-class vec3  {
+struct vec3_t {
+    float x, y, z;
+}
 
+class vec3  {
 
 public:
     __host__ __device__ vec3() {}
