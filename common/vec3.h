@@ -7,7 +7,7 @@
 
 struct vec3_t {
     float x, y, z;
-}
+};
 
 class vec3  {
 

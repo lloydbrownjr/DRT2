@@ -1,4 +1,5 @@
 #include <iostream>
+#include <algorithm>
 #include <string>
 #include <time.h>
 #include <float.h>
@@ -13,33 +14,12 @@
 #include "cuda_errors.h"
 #include "../common/options.h"
 #include "cuda_runtime.h"
-#include "nccl.h"
-#include "mpi.h"
+// #include "nccl.h"
+#include <mpi.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <unordered_map>
-
-
-static uint64_t getHostHash(const char* string) {
-  // Based on DJB2a, result = result * 33 ^ char
-  uint64_t result = 5381;
-  for (int c = 0; string[c] != '\0'; c++){
-    result = ((result << 5) + result) ^ string[c];
-  }
-  return result;
-}
-
-
-static void getHostName(char* hostname, int maxlen) {
-  gethostname(hostname, maxlen);
-  for (int` i=0; i< maxlen; i++) {
-    if (hostname[i] == '.') {
-        hostname[i] = '\0';
-        return;
-    }
-  }
-}
 
 
 #define NCCLCHECK(cmd) do {                         \
@@ -148,10 +128,9 @@ __global__ void render_vec3_t(vec3_t *frame_buffer, int max_x, int max_y, int ns
         col.z += col_addition.z();
     }
     rand_state[pixel_index_local] = local_rand_state;
-    col /= float(ns);
-    col.x = sqrt(col.x);
-    col.y = sqrt(col.y);
-    col.z = sqrt(col.z);
+    col.x = sqrt(col.x / float(ns));
+    col.y = sqrt(col.y / float(ns));
+    col.z = sqrt(col.z / float(ns));
     frame_buffer[pixel_index_local] = col;
 }
 
@@ -403,144 +382,145 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
 }
 
 void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
-    int tx = 8;
-    int ty = 8;
+    // int tx = 8;
+    // int ty = 8;
 
-    std::cerr << "Benchmarking the rendering of " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel ";
-    std::cerr << "in " << tx << "x" << ty << " blocks.\n";
+    // std::cerr << "Benchmarking the rendering of " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel ";
+    // std::cerr << "in " << tx << "x" << ty << " blocks.\n";
 
-    ncclComm_t comms[4];
+    // ncclComm_t comms[4];
 
-    //managing 4 devices
-    int nDev = 4;
-    int devs[4] = { 0, 1, 2, 3 };
+    // //managing 4 devices
+    // int nDev = 4;
+    // int devs[4] = { 0, 1, 2, 3 };
 
-    //allocating and initializing device buffers
-    cudaStream_t* s = (cudaStream_t*)malloc(sizeof(cudaStream_t)*nDev);
+    // //allocating and initializing device buffers
+    // cudaStream_t* s = (cudaStream_t*)malloc(sizeof(cudaStream_t)*nDev);
 
-    int num_pixels = image_width*image_height;
-    size_t frame_buffer_size = num_pixels*sizeof(vec3);
+    // int num_pixels = image_width*image_height;
+    // size_t frame_buffer_size = num_pixels*sizeof(vec3);
 
-    int image_width_dev = image_width;
-    int image_height_dev = image_height / nDev;
-    if (image_width_dev * image_height_dev * nDev != image_height * image_width) {
-        std::cerr << "Not an even split." << std::endl;
-        exit(1);
-    }
-    int num_pixels_dev = num_pixels / nDev;
-    size_t frame_buffer_size_dev = frame_buffer_size / nDev;
+    // int image_width_dev = image_width;
+    // int image_height_dev = image_height / nDev;
+    // if (image_width_dev * image_height_dev * nDev != image_height * image_width) {
+    //     std::cerr << "Not an even split." << std::endl;
+    //     exit(1);
+    // }
+    // int num_pixels_dev = num_pixels / nDev;
+    // size_t frame_buffer_size_dev = frame_buffer_size / nDev;
 
-    vec3** frame_buffer = (vec3**)malloc(nDev * sizeof(vec3*));
-    curandState** d_rand_state = (curandState**)malloc(nDev * sizeof(curandState*));
-    curandState** d_rand_state2 = (curandState**)malloc(nDev * sizeof(curandState*));
-    hitable ***d_list = (hitable***)malloc(nDev * sizeof(hitable**));
-    int num_hitables = 22*22+1+3;
-    hitable ***d_world = (hitable***)malloc(nDev * sizeof(hitable**));
-    camera ***d_camera = (camera***)malloc(nDev * sizeof(camera**));
+    // vec3** frame_buffer = (vec3**)malloc(nDev * sizeof(vec3*));
+    // curandState** d_rand_state = (curandState**)malloc(nDev * sizeof(curandState*));
+    // curandState** d_rand_state2 = (curandState**)malloc(nDev * sizeof(curandState*));
+    // hitable ***d_list = (hitable***)malloc(nDev * sizeof(hitable**));
+    // int num_hitables = 22*22+1+3;
+    // hitable ***d_world = (hitable***)malloc(nDev * sizeof(hitable**));
+    // camera ***d_camera = (camera***)malloc(nDev * sizeof(camera**));
 
-    for (int i = 0; i < nDev; ++i) {
-        checkCudaErrors(cudaSetDevice(i));
+    // for (int i = 0; i < nDev; ++i) {
+    //     checkCudaErrors(cudaSetDevice(i));
 
-        // allocate frame_buffer
-        checkCudaErrors(cudaMallocManaged((void **)&frame_buffer[i], frame_buffer_size_dev));
+    //     // allocate frame_buffer
+    //     checkCudaErrors(cudaMallocManaged((void **)&frame_buffer[i], frame_buffer_size_dev));
 
-        // allocate random state
-        checkCudaErrors(cudaMalloc((void **)&d_rand_state[i], num_pixels_dev*sizeof(curandState)));
-        checkCudaErrors(cudaMalloc((void **)&d_rand_state2[i], 1*sizeof(curandState)));
+    //     // allocate random state
+    //     checkCudaErrors(cudaMalloc((void **)&d_rand_state[i], num_pixels_dev*sizeof(curandState)));
+    //     checkCudaErrors(cudaMalloc((void **)&d_rand_state2[i], 1*sizeof(curandState)));
 
-        // we need that 2nd random state to be initialized for the world creation
-        rand_init<<<1,1>>>(d_rand_state2[i]);
-        checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaDeviceSynchronize());
+    //     // we need that 2nd random state to be initialized for the world creation
+    //     rand_init<<<1,1>>>(d_rand_state2[i]);
+    //     checkCudaErrors(cudaGetLastError());
+    //     checkCudaErrors(cudaDeviceSynchronize());
 
-        // make our world of hitables & the camera
-        checkCudaErrors(cudaMalloc((void **)&d_list[i], num_hitables*sizeof(hitable *)));
-        checkCudaErrors(cudaMalloc((void **)&d_world[i], sizeof(hitable *)));
-        checkCudaErrors(cudaMalloc((void **)&d_camera[i], sizeof(camera *)));
-        create_world<<<1,1>>>(d_list[i], d_world[i], d_camera[i], image_width_dev, image_height_dev, d_rand_state2[i]);
-        checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaDeviceSynchronize());
+    //     // make our world of hitables & the camera
+    //     checkCudaErrors(cudaMalloc((void **)&d_list[i], num_hitables*sizeof(hitable *)));
+    //     checkCudaErrors(cudaMalloc((void **)&d_world[i], sizeof(hitable *)));
+    //     checkCudaErrors(cudaMalloc((void **)&d_camera[i], sizeof(camera *)));
+    //     create_world<<<1,1>>>(d_list[i], d_world[i], d_camera[i], image_width_dev, image_height_dev, d_rand_state2[i]);
+    //     checkCudaErrors(cudaGetLastError());
+    //     checkCudaErrors(cudaDeviceSynchronize());
 
-        checkCudaErrors(cudaStreamCreate(s+i));
-    }
+    //     checkCudaErrors(cudaStreamCreate(s+i));
+    // }
 
-    //initializing NCCL
-    NCCLCHECK(ncclCommInitAll(comms, nDev, devs));
+    // //initializing NCCL
+    // NCCLCHECK(ncclCommInitAll(comms, nDev, devs));
 
-    clock_t start, stop;
-    start = clock();
+    // clock_t start, stop;
+    // start = clock();
 
-    dim3 blocks(image_width_dev/tx+1,image_height_dev/ty+1);
-    dim3 threads(tx,ty);
-    for (int i = 0; i < nDev; ++i) {
-        checkCudaErrors(cudaSetDevice(i));
-        // Render our buffer
-        render_init<<<blocks, threads>>>(image_width_dev, image_height_dev, d_rand_state[i], 0, i*image_height_dev);
-    }
+    // dim3 blocks(image_width_dev/tx+1,image_height_dev/ty+1);
+    // dim3 threads(tx,ty);
+    // for (int i = 0; i < nDev; ++i) {
+    //     checkCudaErrors(cudaSetDevice(i));
+    //     // Render our buffer
+    //     render_init<<<blocks, threads>>>(image_width_dev, image_height_dev, d_rand_state[i], 0, i*image_height_dev);
+    // }
 
-    //synchronizing on CUDA streams to wait for completion of NCCL operation
-    for (int i = 0; i < nDev; ++i) {
-        checkCudaErrors(cudaSetDevice(i));
-        checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaStreamSynchronize(s[i]));
-    }
+    // //synchronizing on CUDA streams to wait for completion of NCCL operation
+    // for (int i = 0; i < nDev; ++i) {
+    //     checkCudaErrors(cudaSetDevice(i));
+    //     checkCudaErrors(cudaGetLastError());
+    //     checkCudaErrors(cudaStreamSynchronize(s[i]));
+    // }
 
-    for (int f = 0; f < num_frames_to_render; f++) {
-        for (int i = 0; i < nDev; ++i) {
-            checkCudaErrors(cudaSetDevice(i));
-            // Render the current frame and make sure it worked.
-            render<<<blocks, threads>>>(frame_buffer[i], image_width_dev, image_height_dev, samples_per_pixel, d_camera[i], d_world[i], d_rand_state[i], 0, i*image_height_dev);
-        }
+    // for (int f = 0; f < num_frames_to_render; f++) {
+    //     for (int i = 0; i < nDev; ++i) {
+    //         checkCudaErrors(cudaSetDevice(i));
+    //         // Render the current frame and make sure it worked.
+    //         render<<<blocks, threads>>>(frame_buffer[i], image_width_dev, image_height_dev, samples_per_pixel, d_camera[i], d_world[i], d_rand_state[i], 0, i*image_height_dev);
+    //     }
 
-        //synchronizing on CUDA streams to wait for completion of NCCL operation
-        for (int i = 0; i < nDev; ++i) {
-            checkCudaErrors(cudaSetDevice(i));
-            checkCudaErrors(cudaGetLastError());
-            checkCudaErrors(cudaStreamSynchronize(s[i]));
-        }
+    //     //synchronizing on CUDA streams to wait for completion of NCCL operation
+    //     for (int i = 0; i < nDev; ++i) {
+    //         checkCudaErrors(cudaSetDevice(i));
+    //         checkCudaErrors(cudaGetLastError());
+    //         checkCudaErrors(cudaStreamSynchronize(s[i]));
+    //     }
 
-        for (int i = 0; i < nDev; ++i) {
-            checkCudaErrors(cudaSetDevice(i));
-            // Move the camera to create the next frame.
-            move_cam<<<blocks, threads>>>(d_camera[i]);
-        }
-    }
+    //     for (int i = 0; i < nDev; ++i) {
+    //         checkCudaErrors(cudaSetDevice(i));
+    //         // Move the camera to create the next frame.
+    //         move_cam<<<blocks, threads>>>(d_camera[i]);
+    //     }
+    // }
 
-    stop = clock();
-    double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
-    std::cerr << "took " << timer_seconds << " seconds to generate " << num_frames_to_render << " frames.\n";
-    std::cerr << "Average FPS: " << (double)num_frames_to_render / timer_seconds << "\n";
+    // stop = clock();
+    // double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
+    // std::cerr << "took " << timer_seconds << " seconds to generate " << num_frames_to_render << " frames.\n";
+    // std::cerr << "Average FPS: " << (double)num_frames_to_render / timer_seconds << "\n";
 
-    // Output frame_buffer as Image
-    write_frame_buffer_arr(frame_buffer, image_width, image_height, image_width, image_height);
+    // // Output frame_buffer as Image
+    // write_frame_buffer_arr(frame_buffer, image_width, image_height, image_width, image_height);
 
-    //free device buffers
-    for (int i = 0; i < nDev; ++i) {
-        checkCudaErrors(cudaSetDevice(i));
-        // clean up
-        checkCudaErrors(cudaDeviceSynchronize());
-        free_world<<<1,1>>>(d_list[i],d_world[i],d_camera[i]);
-        checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaFree(d_camera[i]));
-        checkCudaErrors(cudaFree(d_world[i]));
-        checkCudaErrors(cudaFree(d_list[i]));
-        checkCudaErrors(cudaFree(d_rand_state[i]));
-        checkCudaErrors(cudaFree(d_rand_state2[i]));
-        checkCudaErrors(cudaFree(frame_buffer[i]));
-    }
+    // //free device buffers
+    // for (int i = 0; i < nDev; ++i) {
+    //     checkCudaErrors(cudaSetDevice(i));
+    //     // clean up
+    //     checkCudaErrors(cudaDeviceSynchronize());
+    //     free_world<<<1,1>>>(d_list[i],d_world[i],d_camera[i]);
+    //     checkCudaErrors(cudaGetLastError());
+    //     checkCudaErrors(cudaFree(d_camera[i]));
+    //     checkCudaErrors(cudaFree(d_world[i]));
+    //     checkCudaErrors(cudaFree(d_list[i]));
+    //     checkCudaErrors(cudaFree(d_rand_state[i]));
+    //     checkCudaErrors(cudaFree(d_rand_state2[i]));
+    //     checkCudaErrors(cudaFree(frame_buffer[i]));
+    // }
 
-    //finalizing NCCL
-    for(int i = 0; i < nDev; ++i)
-        ncclCommDestroy(comms[i]);
+    // //finalizing NCCL
+    // for(int i = 0; i < nDev; ++i)
+    //     ncclCommDestroy(comms[i]);
 
-    printf("Success \n");
+    // printf("Success \n");
 
-    cudaDeviceReset();
+    // cudaDeviceReset();
+    (void*)0;
 }
 
 MPI_Datatype VEC3;
 
-void benchmark_frame(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render , int network_latency_in_us, bool has_stragglers) {
+void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int network_latency_in_us, bool has_stragglers) {
     std::cerr << "Benchmarking the rendering of " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel ";
 
     int num_pixels = image_width*image_height;
@@ -548,9 +528,9 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
 
     // Initialize MPI.
     int num_procs, rank = 0;
-    MPICHECK(MPI_Init(&argc, &argv));
-    MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
-    MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &num_procs));
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
     // Create MPI Vec3 Type.
     const int nitems = 3;
@@ -579,32 +559,36 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
 
     // Generate and broadcast random state from rank 0 to all ranks.
-    if (myRank == 0) {
+    if (rank == 0) {
         // Generate.
         rand_init<<<1,1>>>(d_rand_state2);
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaDeviceSynchronize());
-        // Broadcast.
-        MPICHECK(MPI_Bcast((void *)d_rand_state2, sizeof(curandState), MPI_BYTE, 0, MPI_COMM_WORLD));
     }
+
+    // Broadcast.
+    MPI_Bcast((void *)d_rand_state2, sizeof(curandState), MPI_BYTE, 0, MPI_COMM_WORLD);
 
     // All ranks create world.
     create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
-    CUDACHECK(cudaStreamCreate(&s));
-
     // All ranks initialize rendering.
+    int tx = 8;
+    int ty = 8;
     dim3 blocks(image_width/tx+1,image_height/ty+1);
     dim3 threads(tx,ty);
     render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state, 0, 0);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
+    clock_t start, stop;
+    start = clock();
+
     // Now we begin rendering pipeline.
     // Goal is to mimic camera moving through the scene at a defined rate.
-    if (myRank == 0) {
+    if (rank == 0) {
         // Allocate frame buffer.
         vec3_t *frame_buffer;
         checkCudaErrors(cudaMallocManaged((void **)&frame_buffer, frame_buffer_size));
@@ -612,8 +596,8 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
         // Initialize camera origins for each frame.
         vec3_t* camera_origins_for_frames;
         checkCudaErrors(cudaMalloc(&camera_origins_for_frames, num_frames_to_render * sizeof(vec3)));
-        auto current_origin = d_camera.get()->origin;
-        camera_origins_for_frames[0] = {current_origin.x, current_origin.y, current_origin.z};
+        auto current_origin = (*d_camera)->origin;
+        camera_origins_for_frames[0] = {current_origin.x(), current_origin.y(), current_origin.z()};
         for (int i = 1; i < num_frames_to_render; ++i) {
             // Each subsequent frame is offset by the move vector.
             camera_origins_for_frames[i].x = camera_origins_for_frames[i-1].x + camera_move_vector().x();
@@ -623,8 +607,8 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
 
         // Now we begin our work assignment.
         std::vector<int> free_gpus;
-        for (int i = 0; i < nRanks; ++i) {
-            if (i == myRank) continue;
+        for (int i = 0; i < num_procs; ++i) {
+            if (i == rank) continue;
             free_gpus.push_back(i);
         }
         std::vector<int> remaining_frames;
@@ -647,11 +631,11 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
                     int gpu = free_gpus.back();
                     work_assignment[frame] = gpu;
                     free_gpus.pop_back();
-                    if (gpu != myRank) {
+                    if (gpu != rank) {
                         // This is a remote GPU, send to be completed via MPI.
                         work_requests[frame] = new MPI_Request();
-                        MPICHECK(MPI_Send(&camera_origins_for_frames[frame], 1, VEC3, gpu, 0, MPI_COMM_WORLD));
-                        MPICHECK(MPI_Irecv(frame_buffer + frame_id * num_pixels, num_pixels, VEC3, gpu, 0, MPI_COMM_WORLD, work_requests[frame]));
+                        MPI_Send(&camera_origins_for_frames[frame], 1, VEC3, gpu, 0, MPI_COMM_WORLD);
+                        MPI_Irecv(frame_buffer + frame * num_pixels, num_pixels, VEC3, gpu, 0, MPI_COMM_WORLD, work_requests[frame]);
                     }
                 }
             }
@@ -660,17 +644,18 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
             for (auto frame_gpu: work_assignment) {
                 auto frame_id = frame_gpu.first;
                 auto gpu = frame_gpu.second;
-                if (frame_gpu.second == myRank) {
+                if (frame_gpu.second == rank) {
                     // This is our work. We can now render it.
+
                     // Render the current frame and make sure it worked.
-                    render_vec3t<<<blocks, threads>>>(frame_buffer + frame_id * num_pixels, image_height, samples_per_pixel, d_camera, d_world, d_rand_state, 0, 0);
+                    render_vec3_t<<<blocks, threads>>>(frame_buffer + frame_id * num_pixels, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state, 0, 0);
                     checkCudaErrors(cudaGetLastError());
                     checkCudaErrors(cudaDeviceSynchronize());
 
                     // Put GPU back in free list.
                     free_gpus.push_back(gpu);
                     // Remove frame from remaining frames.
-                    remaining_frames.erase(std::find(remaining_frames.begin(), remaining_frames.end(), frame_id));
+                    remaining_frames.erase(std::remove(remaining_frames.begin(), remaining_frames.end(), frame_id), remaining_frames.end());
                     // Remove frame from work assignment.
                     work_assignment.erase(frame_id);
                 } else {
@@ -680,7 +665,7 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
                     if (completed) {
                         // This is done.
                         // Remove frame from remaining frames.
-                        remaining_frames.erase(std::find(remaining_frames.begin(), remaining_frames.end(), frame_id));
+                        remaining_frames.erase(std::remove(remaining_frames.begin(), remaining_frames.end(), frame_id), remaining_frames.end());
                         // Put GPU back in free list.
                         free_gpus.push_back(gpu);
                         // Remove frame from work assignment.
@@ -699,19 +684,25 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
         // Stores the camera origin.
         vec3_t camera_origin = {0,0,0};
         while(true) {
+            MPI_Status status;
             // Attempt to receive the camera origin for the frame.
-            MPICHECK(MPI_Recv(&camera_origin, 1, VEC3, gpu, 0, MPI_COMM_WORLD));
+            MPI_Recv(&camera_origin, 1, VEC3, 0, 0, MPI_COMM_WORLD, &status);
             // Render the frame.
-            render_vec3t<<<blocks, threads>>>(frame_buffer, image_height, samples_per_pixel, d_camera, d_world, d_rand_state, 0, 0);
+            render_vec3_t<<<blocks, threads>>>(frame_buffer, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state, 0, 0);
             checkCudaErrors(cudaGetLastError());
             checkCudaErrors(cudaDeviceSynchronize());
 
             // Send the frame back to the root.
-            MPICHECK(MPI_Send(frame_buffer, num_pixels, VEC3, 0, 0, MPI_COMM_WORLD));
+            MPI_Send(frame_buffer, num_pixels, VEC3, 0, 0, MPI_COMM_WORLD);
         }
     }
 
-    MPI_Abort(MPI_COMM_WORLD)
+    stop = clock();
+    double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
+    std::cerr << "took " << timer_seconds << " seconds to generate " << num_frames_to_render << " frames.\n";
+    std::cerr << "Average FPS: " << (double)num_frames_to_render / timer_seconds << "\n";
+
+    MPI_Abort(MPI_COMM_WORLD, 0);
     MPI_Finalize();
 
     printf("Success \n");
@@ -720,13 +711,13 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
 }
 
 // Benchmarks the throughput of a rendering type.
-void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int number_of_gpus, int network_latency_in_us, bool has_stragglers) {
+void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int network_latency_in_us, bool has_stragglers, int argc, char **argv) {
     if (strcmp(rendering_strategy.c_str(), "singlenode") == 0) {
         benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render);
     } else if (strcmp(rendering_strategy.c_str(), "tiled") == 0) {
         benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render);
     } else if (strcmp(rendering_strategy.c_str(), "frame") == 0) {
-        benchmark_frame(image_height, image_width, samples_per_pixel, num_frames_to_render, number_of_gpus, network_latency_in_us, has_stragglers);
+        benchmark_frame(argc, argv, image_height, image_width, samples_per_pixel, num_frames_to_render, network_latency_in_us, has_stragglers);
     }
 }
 
@@ -741,7 +732,6 @@ int main(int argc, char **argv) {
         std::cout << "-w <int>: width of image in pixels" << std::endl;
         std::cout << "-s <int>: number of samples per pixel" << std::endl;
         std::cout << "-f <int>: number of frames to render" << std::endl;
-        std::cout << "-g <int>: number of GPUs to use" << std::endl;
         std::cout << "-l <int>: emulated network latency" << std::endl;
         std::cout << "-a <int>: stragglers, 0 = no, 1 = yes" << std::endl;
         return 0;
@@ -760,7 +750,6 @@ int main(int argc, char **argv) {
     int num_frames_to_render = find_int_arg(argc, argv, "-f", 30);
 
     std::string rendering_strategy = find_string_option(argc, argv, "-r", std::string("singlenode"));
-    int number_of_gpus = find_int_arg(argc, argv, "-s", 10);
     int network_latency_in_us = find_int_arg(argc, argv, "0", 0);
     bool has_stragglers = find_int_arg(argc, argv, "-a", 0) == 1; 
     if (strcmp(rendering_strategy.c_str(), "singlenode") != 0  && strcmp(rendering_strategy.c_str(), "tiled") != 0 && strcmp(rendering_strategy.c_str(), "frame") != 0) {
@@ -768,5 +757,5 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, number_of_gpus, network_latency_in_us, has_stragglers);
+    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, network_latency_in_us, has_stragglers, argc, argv);
 }
