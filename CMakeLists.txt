@@ -5,6 +5,7 @@ enable_language(CUDA)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
+find_package(MPI REQUIRED)
 
 set(CMAKE_C_COMPILER "gcc-4.2")
 set(CMAKE_CXX_COMPILER "/usr/bin/g++-4.2")
