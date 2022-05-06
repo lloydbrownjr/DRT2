@@ -343,18 +343,20 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     cudaDeviceReset();
 }
 
-void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
+void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_devices = 4) {
     int tx = 8;
     int ty = 8;
 
     std::cerr << "Benchmarking the rendering of " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel ";
     std::cerr << "in " << tx << "x" << ty << " blocks.\n";
 
-    ncclComm_t comms[4];
+    ncclComm_t comms[num_devices];
 
-    //managing 4 devices
-    int nDev = 4;
-    int devs[4] = { 0, 1, 2, 3 };
+    //managing X devices
+    int nDev = num_devices;
+    int devs[num_devices] = {};
+    for (int i = 0; i < num_devices; i++)
+        devs[i] = i;
 
     //allocating and initializing device buffers
     cudaStream_t* s = (cudaStream_t*)malloc(sizeof(cudaStream_t)*nDev);
@@ -485,11 +487,11 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
 }
 
 // Benchmarks the throughput of a rendering type.
-void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
+void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_devices = 4) {
     if (strcmp(rendering_strategy.c_str(), "singlenode") == 0) {
         benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render);
     } else if (strcmp(rendering_strategy.c_str(), "tiled") == 0) {
-        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render);
+        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, num_devices);
     } else if (strcmp(rendering_strategy.c_str(), "frame") == 0) {
         benchmark_frame(image_height, image_width, samples_per_pixel, num_frames_to_render);
     }
@@ -506,6 +508,7 @@ int main(int argc, char **argv) {
         std::cout << "-w <int>: width of image in pixels" << std::endl;
         std::cout << "-s <int>: number of samples per pixel" << std::endl;
         std::cout << "-f <int>: number of frames to render" << std::endl;
+        std::cout << "-d <int>: number of devices to use" << std::endl;
         return 0;
     }
 
@@ -520,6 +523,7 @@ int main(int argc, char **argv) {
     }
 
     int num_frames_to_render = find_int_arg(argc, argv, "-f", 30);
+    int num_devices = find_int_arg(argc, argv, "-d", 4);
 
     std::string rendering_strategy = find_string_option(argc, argv, "-r", std::string("singlenode"));
     if (strcmp(rendering_strategy.c_str(), "singlenode") != 0  && strcmp(rendering_strategy.c_str(), "tiled") != 0 && strcmp(rendering_strategy.c_str(), "frame") != 0) {
@@ -527,5 +531,5 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render);
+    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, num_devices);
 }
