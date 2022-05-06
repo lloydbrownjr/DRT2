@@ -15,7 +15,7 @@
 #include "../common/options.h"
 #include "cuda_runtime.h"
 // #include "nccl.h"
-#include <mpi.h>
+#include "/opt/packages/mvapich2/intel/2.3.5-intel20.4/include/mpi.h"
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
