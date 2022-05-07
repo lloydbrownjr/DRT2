@@ -10,15 +10,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
 # find_package(LibXml2 REQUIRED)
 
-# include_directories(SYSTEM /opt/packages/mvapich2/intel/2.3.5-intel20.4/include)
-# set(MPI_PREFIX "/opt/packages/mvapich2-2.3.5/gcc-8.3.1")
-# # set(MPI_PREFIX "/opt/packages/openmpi/gcc/4.0.2-gcc8.3.1")
-# set(MPI_INCLUDE_DIR "${MPI_PREFIX}/include")
-# set(MPI_SHARED_LIB_NAME "${CMAKE_STATIC_LIBRARY_PREFIX}mpi")
-# set(MPI_LIBRARIES "${MPI_PREFIX}/lib/${MPI_SHARED_LIB_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX}")
-# include_directories(SYSTEM ${MPI_INCLUDE_DIR})
+include_directories(SYSTEM /opt/packages/mvapich2/intel/2.3.5-intel20.4/include)
+set(MPI_PREFIX "/opt/packages/mvapich2-2.3.5/gcc-8.3.1")
+# set(MPI_PREFIX "/opt/packages/openmpi/gcc/4.0.2-gcc8.3.1")
+set(MPI_INCLUDE_DIR "${MPI_PREFIX}/include")
+set(MPI_SHARED_LIB_NAME "${CMAKE_STATIC_LIBRARY_PREFIX}mpi")
+set(MPI_LIBRARIES "${MPI_PREFIX}/lib/${MPI_SHARED_LIB_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+include_directories(SYSTEM ${MPI_INCLUDE_DIR})
 
-find_package(MPI REQUIRED)
+# find_package(MPI REQUIRED)
 
 # We require the GNU compiler for this assignment.
 if (NOT "${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
@@ -31,9 +31,8 @@ endif ()
 
 add_executable(cudart src/main.cu src/camera.h src/hitable.h src/hitable_list.h src/material.h src/cuda_errors.h common/ray.h src/sphere.h common/vec3.h common/options.h)
 target_include_directories(cudart PRIVATE "~/.conda/pkgs/nccl-2.12.10.1-h0800d71_0/include")
-target_link_libraries(cudart PRIVATE "~/.conda/pkgs/nccl-2.12.10.1-h0800d71_0/lib/libnccl.so")
-# target_link_libraries(mpi ${MPI_LIBRARIES} ${LibXml2_LIBRARIES})
-target_link_libraries(cudart PRIVATE MPI::MPI_CXX)
+target_link_libraries(cudart PRIVATE "~/.conda/pkgs/nccl-2.12.10.1-h0800d71_0/lib/libnccl.so" ${MPI_LIBRARIES} ${LibXml2_LIBRARIES})
+# target_link_libraries(cudart PRIVATE MPI::MPI_CXX)
 target_compile_features(cudart PRIVATE cxx_std_11)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_60")
 
