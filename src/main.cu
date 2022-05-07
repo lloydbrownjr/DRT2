@@ -533,6 +533,13 @@ __global__ void init_origins_for_frames(vec3_t* camera_origins_for_frames, int n
     }
 }
 
+// Moves camera origin based on input vector.
+__global__ void update_camera_origin(vec3_t* new_origin, camera** d_camera) {
+    (*d_camera)->origin.e[0] = new_origin->x;
+    (*d_camera)->origin.e[1] = new_origin->y;
+    (*d_camera)->origin.e[2] = new_origin->z;
+}
+
 
 void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int network_latency_in_us, bool has_stragglers) {
     std::cerr << "Benchmarking the rendering of " << num_frames_to_render << " " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel " << std::endl;
@@ -546,9 +553,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-    //std::cout << 1 << std::endl;
-    //fflush(stdout);
-
     std::cout << "Running on " << num_procs << " processes" << std::endl;
 
     // Create MPI Vec3 Type.
@@ -561,9 +565,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     offsets[2] = offsetof(vec3_t, z);
     MPI_Type_create_struct(nitems, blocklengths, offsets, types, &VEC3);
     MPI_Type_commit(&VEC3);
-
-    //std::cout << 2 << std::endl;
-    //fflush(stdout);
 
     // Allocate random state.
     curandState *d_rand_state;
@@ -580,9 +581,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
 
-    //std::cout << 3 << std::endl;
-    //fflush(stdout);
-
     // Generate and broadcast random state from rank 0 to all ranks.
     if (rank == 0) {
         // Generate.
@@ -590,9 +588,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaDeviceSynchronize());
     }
-
-    //std::cout << 4 << std::endl;
-    //fflush(stdout);
 
     // Broadcast.
     MPI_Bcast((void *)d_rand_state2, sizeof(curandState), MPI_BYTE, 0, MPI_COMM_WORLD);
@@ -602,9 +597,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
-    //std::cout << 5 << std::endl;
-    //fflush(stdout);
-
     // All ranks initialize rendering.
     int tx = 8;
     int ty = 8;
@@ -613,9 +605,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state, 0, 0);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-
-    //std::cout << 6 << std::endl;
-    //fflush(stdout);
 
     clock_t start, stop;
     start = clock();
@@ -627,32 +616,23 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         vec3_t *frame_buffer;
         checkCudaErrors(cudaMallocManaged((void **)&frame_buffer, frame_buffer_size));
 
-        //std::cout << 7 << std::endl;
-        //fflush(stdout);
-
         // Initialize camera origins for each frame.
         vec3_t* camera_origins_for_frames;
         checkCudaErrors(cudaMalloc((void **)&camera_origins_for_frames, num_frames_to_render * sizeof(vec3_t)));
         init_origins_for_frames<<<1,1>>>(camera_origins_for_frames, num_frames_to_render, d_camera);
 
-        //std::cout << 77 << std::endl;
-        //fflush(stdout);
-
         // Now we begin our work assignment.
         std::vector<int> free_gpus;
-        for (int i = 0; i < num_procs; ++i) {
-            if (i == rank) continue;
+        for (int i = 0; i < num_procs; i++) {
             free_gpus.push_back(i);
         }
         std::vector<int> remaining_frames;
-        for (int i = 0; i < num_frames_to_render; ++i) {
+        for (int i = 0; i < num_frames_to_render; i++) {
             remaining_frames.push_back(i);
         }
         std::unordered_map<int, int> work_assignment;
         std::unordered_map<int, MPI_Request*> work_requests;
         while (remaining_frames.size() > 0) {
-            //std::cout << 8 << std::endl;
-            //fflush(stdout);
             // Assignment loop.
             for (auto frame: remaining_frames) {
                 if (work_assignment.find(frame) == work_assignment.end()) {
@@ -674,8 +654,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                     }
                 }
             }
-            //std::cout << 9 << std::endl;
-            //fflush(stdout);
 
             // Check for assignment completions.
             for (auto frame_gpu: work_assignment) {
@@ -718,12 +696,14 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         vec3_t *frame_buffer;
         checkCudaErrors(cudaMallocManaged((void **)&frame_buffer, frame_buffer_size / num_frames_to_render));
 
-        // Stores the camera origin.
+        // Stores the camera origins from the root.
         vec3_t camera_origin = {0,0,0};
         while(true) {
             MPI_Status status;
             // Attempt to receive the camera origin for the frame.
             MPI_Recv(&camera_origin, 1, VEC3, 0, 0, MPI_COMM_WORLD, &status);
+            // Update camera origin for the frame.
+            update_camera_origin<<<1,1>>>(&camera_origin, d_camera);
             // Render the frame.
             render_vec3_t<<<blocks, threads>>>(frame_buffer, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state, 0, 0);
             checkCudaErrors(cudaGetLastError());
