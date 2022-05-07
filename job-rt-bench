@@ -5,4 +5,4 @@
 #SBATCH -t 00:30:00
 #SBATCH --gres=gpu:4
 
-./cudart -t 1 -t tiled
+./cudart -t 1 -r tiled

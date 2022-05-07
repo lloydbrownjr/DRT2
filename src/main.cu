@@ -515,7 +515,7 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
 
     //synchronizing on CUDA streams to wait for completion of NCCL operation
     checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaStreamSynchronize(s));
+    checkCudaErrors(cudaDeviceSynchronize());
 
     for (int f = 0; f < num_frames_to_render; f++) {
         // Render the current frame and make sure it worked.
@@ -523,7 +523,7 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
 
         //synchronizing on CUDA streams to wait for completion of NCCL operation
         checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaStreamSynchronize(s));
+        checkCudaErrors(cudaDeviceSynchronize());
 
         // Move the camera to create the next frame.
         move_cam<<<blocks, threads>>>(d_camera);
