@@ -12,6 +12,7 @@
 #include "cuda_errors.h"
 #include "../common/options.h"
 #include <vector>
+#include <omp.h>
 
 #define num_hitables (22*22 + 1 + 3)
 
@@ -70,7 +71,8 @@ __global__ void render_init_tiled(int x_range, int y_range, curandState *rand_st
 }
 
 __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_height, int x_start, int y_start, int x_range, int y_range,
-        int number_samples, camera **cam, hitable **world, curandState *rand_state) {
+        int number_samples, camera **cam, hitable **world, curandState *rand_state, int gpu_id = 0, int num_gpus = 1) {
+
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if (i >= x_range || j >= y_range) {
@@ -91,6 +93,7 @@ __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_heig
     rand_state[local_index] = local_rand_state;
     col /= float(number_samples);
     frame_buffer[pixel_index] = col.getsqrt();
+    // frame_buffer[pixel_index] = 255.99 * gpu_id / 4;
 }
 
 #define RND (curand_uniform(&local_rand_state))
@@ -316,7 +319,7 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     cudaDeviceReset();
 }
 
-void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_gpus = -1) {
+void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_gpus = 0) {
     int tx = 8;
     int ty = 8;
 
@@ -334,7 +337,7 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     if (num_gpus > available_gpus) {
         std::cerr << "requeted more than available GPUs, capping." << std::endl;
         num_gpus = available_gpus;
-    } else if (num_gpus == -1) {
+    } else if (num_gpus == 0) {
         num_gpus = available_gpus;
     }
 
@@ -344,7 +347,14 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     int per_gpu_height = image_height / num_gpus;
     int num_pixels_per_gpu = per_gpu_width * per_gpu_height;
 
-    dim3 blocks(per_gpu_width / tx + 1, per_gpu_height / ty + 1);
+    int num_tasks_x = 1;
+    int per_task_width = image_width / num_tasks_x;
+    int num_tasks_y = num_gpus;
+    int per_task_height = image_height / num_tasks_y;
+    int num_tasks = num_tasks_x * num_tasks_y;
+    int num_pixels_per_task = per_task_width * per_task_height;
+
+    dim3 blocks(per_task_width / tx + 1, per_task_height / ty + 1);
     dim3 threads(tx, ty);
 
     // allocate random state
@@ -355,9 +365,10 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     vector<hitable **> d_list(num_gpus);
     vector<hitable **> d_world(num_gpus);
     vector<camera **> d_camera(num_gpus);
+#pragma omp parallel for num_threads(num_gpus)
     for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
         checkCudaErrors(cudaSetDevice(gpu_id));
-        checkCudaErrors(cudaMalloc((void **) &d_rand_state[gpu_id], num_pixels_per_gpu * sizeof(curandState)));
+        checkCudaErrors(cudaMalloc((void **) &d_rand_state[gpu_id], num_pixels_per_task * sizeof(curandState)));
         checkCudaErrors(cudaMalloc((void **) &d_rand_state2[gpu_id], 1 * sizeof(curandState)));
         checkCudaErrors(cudaStreamCreate(&streams[gpu_id]));
         rand_init<<<1, 1>>>(d_rand_state2[gpu_id]);
@@ -373,21 +384,48 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     clock_t start, stop;
     start = clock();
     // Render our buffer
+#pragma omp parallel for num_threads(num_gpus)
     for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
         checkCudaErrors(cudaSetDevice(gpu_id));
-        render_init_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(per_gpu_width, per_gpu_height, d_rand_state[gpu_id]);
+        render_init_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(per_task_width, per_task_height, d_rand_state[gpu_id]);
         // render_init<<<blocks, threads, 0, streams[gpu_id]>>>(image_width, image_height, d_rand_state[gpu_id], gpu_id, num_gpus);
+    }
+
+    vector<std::pair<int, int>> tasks(num_tasks);
+    for (int x = 0; x < num_tasks_x; x++) {
+        for (int y = 0; y < num_tasks_y; y++) {
+            tasks.push_back(std::pair<int, int>(per_task_width * x, per_task_height * y));
+        }
     }
     for (int stream_id = 0; stream_id < num_streams; stream_id++) {
         checkCudaErrors(cudaStreamSynchronize(streams[stream_id]));
     }
+
     for (int i = 0; i < num_frames_to_render; i++) {
+        int task_counter = 0;
+#pragma omp parallel for num_threads(num_gpus)
         for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
             checkCudaErrors(cudaSetDevice(gpu_id));
-            int x_start = 0, y_start = image_height * gpu_id / num_gpus;
-            render_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(frame_buffer, image_width, image_height, x_start, y_start, per_gpu_width, per_gpu_height,
-                samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id]);
-            checkCudaErrors(cudaGetLastError());
+            int x_start, y_start;
+            int my_task;
+            while (true) {
+                #pragma omp critical
+                {
+                my_task = task_counter++;
+                }
+
+                if (my_task >= num_tasks) {
+                    break;
+                }
+                const auto& fetch = tasks[my_task];
+                x_start = fetch.first;
+                y_start = fetch.second;
+
+                // int x_start = 0, y_start = image_height * gpu_id / num_gpus;
+                render_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(frame_buffer, image_width, image_height, x_start, y_start, per_task_width, per_task_height,
+                    samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id], gpu_id, num_gpus);
+                checkCudaErrors(cudaGetLastError());
+            }
             move_cam<<<1, 1, 0, streams[gpu_id]>>>(d_camera[gpu_id]);
             checkCudaErrors(cudaGetLastError());
         }
@@ -463,7 +501,7 @@ int main(int argc, char **argv) {
     }
 
     int num_frames_to_render = find_int_arg(argc, argv, "-f", 30);
-    int requested_gpus = find_int_arg(argc, argv, "-g", -1);
+    int requested_gpus = find_int_arg(argc, argv, "-g", 0);
 
     std::string rendering_strategy = find_string_option(argc, argv, "-r", std::string("singlenode"));
     if (strcmp(rendering_strategy.c_str(), "singlenode") != 0  && strcmp(rendering_strategy.c_str(), "tiled") != 0 && strcmp(rendering_strategy.c_str(), "frame") != 0) {
@@ -472,4 +510,5 @@ int main(int argc, char **argv) {
     }
 
     benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
+    return 0;
 }
