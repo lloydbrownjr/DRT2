@@ -34,17 +34,17 @@ __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_sta
                 cur_ray = scattered;
             }
             else {
-                return vec3(0.0,0.0,0.0);
+                return vec3(0.0, 0.0, 0.0);
             }
         }
         else {
             vec3 unit_direction = unit_vector(cur_ray.direction());
-            float t = 0.5f*(unit_direction.y() + 1.0f);
-            vec3 c = (1.0f-t)*vec3(1.0, 1.0, 1.0) + t*vec3(0.5, 0.7, 1.0);
+            float t = 0.5f * (unit_direction.y() + 1.0f);
+            vec3 c = (1.0f-t) * vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
             return cur_attenuation * c;
         }
     }
-    return vec3(0.0,0.0,0.0); // exceeded recursion
+    return vec3(0.0, 0.0, 0.0); // exceeded recursion
 }
 
 __global__ void rand_init(curandState *rand_state) {
@@ -98,18 +98,18 @@ __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_heig
 __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         curandState local_rand_state = *rand_state;
-        d_list[0] = new sphere(vec3(0,-1000.0,-1), 1000,
+        d_list[0] = new sphere(vec3(0, -1000, -1), 1000,
                                new lambertian(vec3(0.5, 0.5, 0.5)));
         int i = 1;
         for(int a = -11; a < 11; a++) {
             for(int b = -11; b < 11; b++) {
                 float choose_mat = RND;
                 vec3 center(a+RND,0.2,b+RND);
-                if(choose_mat < 0.8f) {
+                if (choose_mat < 0.8f) {
                     d_list[i++] = new sphere(center, 0.2,
                                              new lambertian(vec3(RND*RND, RND*RND, RND*RND)));
                 }
-                else if(choose_mat < 0.95f) {
+                else if (choose_mat < 0.95f) {
                     d_list[i++] = new sphere(center, 0.2,
                                              new metal(vec3(0.5f*(1.0f+RND), 0.5f*(1.0f+RND), 0.5f*(1.0f+RND)), 0.5f*RND));
                 }
@@ -124,7 +124,7 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
         *rand_state = local_rand_state;
         *d_world  = new hitable_list(d_list, num_hitables);
 
-        vec3 lookfrom(13,2,3);
+        vec3 lookfrom(13, 2, 3);
         vec3 lookat(0,0,0);
         float dist_to_focus = 10.0; (lookfrom-lookat).length();
         float aperture = 0.1;
@@ -160,12 +160,12 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
 void write_frame_buffer(vec3 *frame_buffer, int nx, int ny, int max_x, int max_y) {
     FILE *f = fopen("output.ppm", "w");
     fprintf(f, "P3\n%d %d\n255\n", max_x, max_y);
-    for(int j=0; j < max_y; j++) {
-        for(int i=0; i < max_x; i++) {
+    for(int j = 0; j < max_y; j++) {
+        for(int i = 0; i < max_x; i++) {
             vec3 col = frame_buffer[j*max_x + i];
-            int ir = int(255.99*col[0]);
-            int ig = int(255.99*col[1]);
-            int ib = int(255.99*col[2]);
+            int ir = int(255.99 * col[0]);
+            int ig = int(255.99 * col[1]);
+            int ib = int(255.99 * col[2]);
             fprintf(f, "%d %d %d ", ir, ig, ib);
         }
         fprintf(f, "\n");
