@@ -520,8 +520,22 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
 
 MPI_Datatype VEC3;
 
+// Initializes the camera origins data structure.
+__global__ void init_origins_for_frames(vec3_t* camera_origins_for_frames, int num_frames_to_render, camera** d_camera) {
+    auto current_origin = (*d_camera)->origin;
+    auto move_vector = vec3(0,0,-0.1);
+    camera_origins_for_frames[0] = {current_origin.x(), current_origin.y(), current_origin.z()};
+    for (int i = 1; i < num_frames_to_render; ++i) {
+        // Each subsequent frame is offset by the move vector.
+        camera_origins_for_frames[i].x = camera_origins_for_frames[i-1].x + move_vector.x();
+        camera_origins_for_frames[i].y = camera_origins_for_frames[i-1].y + move_vector.y();
+        camera_origins_for_frames[i].z = camera_origins_for_frames[i-1].z + move_vector.z();
+    }
+}
+
+
 void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int network_latency_in_us, bool has_stragglers) {
-    std::cerr << "Benchmarking the rendering of " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel ";
+    std::cerr << "Benchmarking the rendering of " << num_frames_to_render << " " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel " << std::endl;
 
     int num_pixels = image_width*image_height;
     size_t frame_buffer_size = num_pixels*sizeof(vec3_t)*num_frames_to_render;
@@ -531,6 +545,11 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+
+    //std::cout << 1 << std::endl;
+    //fflush(stdout);
+
+    std::cout << "Running on " << num_procs << " processes" << std::endl;
 
     // Create MPI Vec3 Type.
     const int nitems = 3;
@@ -542,6 +561,9 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     offsets[2] = offsetof(vec3_t, z);
     MPI_Type_create_struct(nitems, blocklengths, offsets, types, &VEC3);
     MPI_Type_commit(&VEC3);
+
+    //std::cout << 2 << std::endl;
+    //fflush(stdout);
 
     // Allocate random state.
     curandState *d_rand_state;
@@ -558,6 +580,9 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
 
+    //std::cout << 3 << std::endl;
+    //fflush(stdout);
+
     // Generate and broadcast random state from rank 0 to all ranks.
     if (rank == 0) {
         // Generate.
@@ -565,6 +590,9 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaDeviceSynchronize());
     }
+
+    //std::cout << 4 << std::endl;
+    //fflush(stdout);
 
     // Broadcast.
     MPI_Bcast((void *)d_rand_state2, sizeof(curandState), MPI_BYTE, 0, MPI_COMM_WORLD);
@@ -574,6 +602,9 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
+    //std::cout << 5 << std::endl;
+    //fflush(stdout);
+
     // All ranks initialize rendering.
     int tx = 8;
     int ty = 8;
@@ -582,6 +613,9 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state, 0, 0);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
+
+    //std::cout << 6 << std::endl;
+    //fflush(stdout);
 
     clock_t start, stop;
     start = clock();
@@ -593,17 +627,16 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         vec3_t *frame_buffer;
         checkCudaErrors(cudaMallocManaged((void **)&frame_buffer, frame_buffer_size));
 
+        //std::cout << 7 << std::endl;
+        //fflush(stdout);
+
         // Initialize camera origins for each frame.
         vec3_t* camera_origins_for_frames;
-        checkCudaErrors(cudaMalloc(&camera_origins_for_frames, num_frames_to_render * sizeof(vec3)));
-        auto current_origin = (*d_camera)->origin;
-        camera_origins_for_frames[0] = {current_origin.x(), current_origin.y(), current_origin.z()};
-        for (int i = 1; i < num_frames_to_render; ++i) {
-            // Each subsequent frame is offset by the move vector.
-            camera_origins_for_frames[i].x = camera_origins_for_frames[i-1].x + camera_move_vector().x();
-            camera_origins_for_frames[i].y = camera_origins_for_frames[i-1].y + camera_move_vector().y();
-            camera_origins_for_frames[i].z = camera_origins_for_frames[i-1].z + camera_move_vector().z();
-        }
+        checkCudaErrors(cudaMalloc((void **)&camera_origins_for_frames, num_frames_to_render * sizeof(vec3_t)));
+        init_origins_for_frames<<<1,1>>>(camera_origins_for_frames, num_frames_to_render, d_camera);
+
+        //std::cout << 77 << std::endl;
+        //fflush(stdout);
 
         // Now we begin our work assignment.
         std::vector<int> free_gpus;
@@ -618,6 +651,8 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         std::unordered_map<int, int> work_assignment;
         std::unordered_map<int, MPI_Request*> work_requests;
         while (remaining_frames.size() > 0) {
+            //std::cout << 8 << std::endl;
+            //fflush(stdout);
             // Assignment loop.
             for (auto frame: remaining_frames) {
                 if (work_assignment.find(frame) == work_assignment.end()) {
@@ -639,6 +674,8 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                     }
                 }
             }
+            //std::cout << 9 << std::endl;
+            //fflush(stdout);
 
             // Check for assignment completions.
             for (auto frame_gpu: work_assignment) {
@@ -724,16 +761,16 @@ void benchmark_rendering(std::string rendering_strategy, int image_height, int i
 int main(int argc, char **argv) {
     // Parse Args
     if (find_arg_idx(argc, argv, "-h") >= 0) {
-        std::cout << "Options:" << std::endl;
-        std::cout << "-h: see this help" << std::endl;
-        std::cout << "-t <int>: type, 0 = test, 1 = benchmark" << std::endl;
-        std::cout << "-r <rendering strategy>: singlenode/tiled/frame" << std::endl;
-        std::cout << "-v <int>: vertical height of image in pixels" << std::endl;
-        std::cout << "-w <int>: width of image in pixels" << std::endl;
-        std::cout << "-s <int>: number of samples per pixel" << std::endl;
-        std::cout << "-f <int>: number of frames to render" << std::endl;
-        std::cout << "-l <int>: emulated network latency" << std::endl;
-        std::cout << "-a <int>: stragglers, 0 = no, 1 = yes" << std::endl;
+        //std::cout << "Options:" << std::endl;
+        //std::cout << "-h: see this help" << std::endl;
+        //std::cout << "-t <int>: type, 0 = test, 1 = benchmark" << std::endl;
+        //std::cout << "-r <rendering strategy>: singlenode/tiled/frame" << std::endl;
+        //std::cout << "-v <int>: vertical height of image in pixels" << std::endl;
+        //std::cout << "-w <int>: width of image in pixels" << std::endl;
+        //std::cout << "-s <int>: number of samples per pixel" << std::endl;
+        //std::cout << "-f <int>: number of frames to render" << std::endl;
+        //std::cout << "-l <int>: emulated network latency" << std::endl;
+        //std::cout << "-a <int>: stragglers, 0 = no, 1 = yes" << std::endl;
         return 0;
     }
 
