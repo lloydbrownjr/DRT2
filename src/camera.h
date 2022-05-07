@@ -31,7 +31,7 @@ public:
         horizontal = 2.0f*half_width*focus_dist*u;
         vertical = 2.0f*half_height*focus_dist*v;
     }
-    __device__ ray get_ray(float s, float t, curandState *local_rand_state) {
+    __device__ ray get_ray(float s, float t, curandState *local_rand_state) const {
         vec3 rd = lens_radius*random_in_unit_disk(local_rand_state);
         vec3 offset = u * rd.x() + v * rd.y();
         return ray(origin + offset, lower_left_corner + s*horizontal + t*vertical - origin - offset);

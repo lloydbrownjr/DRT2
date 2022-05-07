@@ -20,6 +20,7 @@ public:
 
     __host__ __device__ inline const vec3& operator+() const { return *this; }
     __host__ __device__ inline vec3 operator-() const { return vec3(-e[0], -e[1], -e[2]); }
+    __host__ __device__ inline vec3 getsqrt() const { return vec3(sqrt(e[0]), sqrt(e[1]), sqrt(e[2])); }
     __host__ __device__ inline float operator[](int i) const { return e[i]; }
     __host__ __device__ inline float& operator[](int i) { return e[i]; };
 

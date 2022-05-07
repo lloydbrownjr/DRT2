@@ -11,6 +11,9 @@
 #include "material.h"
 #include "cuda_errors.h"
 #include "../common/options.h"
+#include <vector>
+
+#define num_hitables 22*22 + 1 + 3
 
 // This method determines the color of a ray going through the scene by tracing it through the scene and hitting objects.
 // It has been modified to use CUDA as described below.
@@ -50,11 +53,15 @@ __global__ void rand_init(curandState *rand_state) {
     }
 }
 
-__global__ void render_init(int max_x, int max_y, curandState *rand_state) {
+__global__ void render_init_tiled(int x_range, int y_range, curandState *rand_state) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
-    if((i >= max_x) || (j >= max_y)) return;
-    int pixel_index = j*max_x + i;
+
+    if (i >= x_range || j >= y_range) {
+        return;
+    }
+
+    int pixel_index = j * x_range + i;
     // Original: Each thread gets same seed, a different sequence number, no offset
     // curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
     // BUGFIX, see Issue#2: Each thread gets different seed, same sequence for
@@ -62,25 +69,28 @@ __global__ void render_init(int max_x, int max_y, curandState *rand_state) {
     curand_init(1984+pixel_index, 0, 0, &rand_state[pixel_index]);
 }
 
-__global__ void render(vec3 *frame_buffer, int max_x, int max_y, int ns, camera **cam, hitable **world, curandState *rand_state) {
+__global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_height, int x_start, int y_start, int x_range, int y_range,
+        int number_samples, camera **cam, hitable **world, curandState *rand_state) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
-    if((i >= max_x) || (j >= max_y)) return;
-    int pixel_index = j*max_x + i;
-    curandState local_rand_state = rand_state[pixel_index];
-    vec3 col(0,0,0);
-    for(int s=0; s < ns; s++) {
-        float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
-        float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
+    if (i >= x_range || j >= y_range) {
+        return;
+    }
+    int local_index = j * x_range + i;
+    curandState local_rand_state = rand_state[local_index];
+    int pixel_x = x_start + i;
+    int pixel_y = y_start + j;
+    int pixel_index = pixel_y * image_width + pixel_x;
+    vec3 col(0, 0, 0);
+    for(int sample = 0; sample < number_samples; sample++) {
+        float u = float(pixel_x + curand_uniform(&local_rand_state)) / float(image_width);
+        float v = float(pixel_y + curand_uniform(&local_rand_state)) / float(image_height);
         ray r = (*cam)->get_ray(u, v, &local_rand_state);
         col += color(r, world, &local_rand_state);
     }
-    rand_state[pixel_index] = local_rand_state;
-    col /= float(ns);
-    col[0] = sqrt(col[0]);
-    col[1] = sqrt(col[1]);
-    col[2] = sqrt(col[2]);
-    frame_buffer[pixel_index] = col;
+    rand_state[local_index] = local_rand_state;
+    col /= float(number_samples);
+    frame_buffer[pixel_index] = col.getsqrt();
 }
 
 #define RND (curand_uniform(&local_rand_state))
@@ -112,7 +122,7 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
         d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
         d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
         *rand_state = local_rand_state;
-        *d_world  = new hitable_list(d_list, 22*22+1+3);
+        *d_world  = new hitable_list(d_list, num_hitables);
 
         vec3 lookfrom(13,2,3);
         vec3 lookat(0,0,0);
@@ -129,19 +139,21 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
 }
 
 // Moves the camera's origin to create a new scene
-__global__ void move_cam(camera **d_camera) {
+__global__ void move_cam(camera **d_camera, int steps = 1) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        (*d_camera)->origin += vec3(0,0,-0.1);
+        (*d_camera)->origin += steps * vec3(0, 0, -0.1);
     }
 }
 
 __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera) {
-    for(int i=0; i < 22*22+1+3; i++) {
-        delete ((sphere *)d_list[i])->mat_ptr;
-        delete d_list[i];
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        for (int i = 0; i < num_hitables; i++) {
+            delete ((sphere *)d_list[i])->mat_ptr;
+            delete d_list[i];
+        }
+        delete *d_world;
+        delete *d_camera;
     }
-    delete *d_world;
-    delete *d_camera;
 }
 
 // Writes the image to a ppm file.
@@ -183,19 +195,18 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
     checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
 
     // we need that 2nd random state to be initialized for the world creation
-    rand_init<<<1,1>>>(d_rand_state2);
+    rand_init<<<1, 1>>>(d_rand_state2);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
     // make our world of hitables & the camera
     hitable **d_list;
-    int num_hitables = 22*22+1+3;
     checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
     hitable **d_world;
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
@@ -204,10 +215,10 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
     // Render our buffer
     dim3 blocks(image_width/tx+1,image_height/ty+1);
     dim3 threads(tx,ty);
-    render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state);
+    // render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
-    render<<<blocks, threads>>>(frame_buffer, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state);
+    // render<<<blocks, threads>>>(frame_buffer, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     stop = clock();
@@ -258,8 +269,7 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
 
     // make our world of hitables & the camera
     hitable **d_list;
-    int num_hitables = 22*22+1+3;
-    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
+    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hitable *)));
     hitable **d_world;
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
@@ -273,12 +283,12 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     // Render our buffer
     dim3 blocks(image_width/tx+1,image_height/ty+1);
     dim3 threads(tx,ty);
-    render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state);
+    render_init_tiled<<<blocks, threads>>>(image_width, image_height, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     for (int i = 0; i < num_frames_to_render; i++) {
         // Render the current frame and make sure it worked.
-        render<<<blocks, threads>>>(frame_buffer, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state);
+        render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, 0, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state);
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaDeviceSynchronize());
         // Move the camera to create the next frame.
@@ -306,9 +316,115 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     cudaDeviceReset();
 }
 
-void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
-    std::cerr << "Not implemented." << std::endl;
-    exit(1);
+void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_gpus = -1) {
+    int tx = 8;
+    int ty = 8;
+
+    std::cerr << "Benchmarking the rendering of " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel ";
+    std::cerr << "in " << tx << "x" << ty << " blocks.\n";
+
+    int num_pixels = image_width * image_height;
+
+    // allocate frame_buffer
+    vec3 *frame_buffer;
+    checkCudaErrors(cudaMallocManaged((void **)&frame_buffer, num_pixels * sizeof(vec3)));
+
+    int available_gpus;
+    checkCudaErrors(cudaGetDeviceCount(&available_gpus));
+    if (num_gpus > available_gpus) {
+        std::cerr << "requeted more than available GPUs, capping." << std::endl;
+        num_gpus = available_gpus;
+    } else if (num_gpus == -1) {
+        num_gpus = available_gpus;
+    }
+
+    int num_streams = num_gpus;
+    
+    int per_gpu_width = image_width;
+    int per_gpu_height = image_height / num_gpus;
+    int num_pixels_per_gpu = per_gpu_width * per_gpu_height;
+
+    dim3 blocks(per_gpu_width / tx + 1, per_gpu_height / ty + 1);
+    dim3 threads(tx, ty);
+
+    // allocate random state
+    using std::vector;
+    vector<curandState *> d_rand_state(num_gpus);
+    vector<curandState *> d_rand_state2(num_gpus);
+    vector<cudaStream_t> streams(num_streams);
+    vector<hitable **> d_list(num_gpus);
+    vector<hitable **> d_world(num_gpus);
+    vector<camera **> d_camera(num_gpus);
+    for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
+        checkCudaErrors(cudaSetDevice(gpu_id));
+        checkCudaErrors(cudaMalloc((void **) &d_rand_state[gpu_id], num_pixels_per_gpu * sizeof(curandState)));
+        checkCudaErrors(cudaMalloc((void **) &d_rand_state2[gpu_id], 1 * sizeof(curandState)));
+        checkCudaErrors(cudaStreamCreate(&streams[gpu_id]));
+        rand_init<<<1, 1>>>(d_rand_state2[gpu_id]);
+        checkCudaErrors(cudaGetLastError());
+        checkCudaErrors(cudaMalloc((void **) &d_list[gpu_id], num_hitables * sizeof(hitable *)));
+        checkCudaErrors(cudaMalloc((void **) &d_world[gpu_id], 1 * sizeof(hitable *)));
+        checkCudaErrors(cudaMalloc((void **) &d_camera[gpu_id], 1 * sizeof(camera *)));
+        cudaDeviceSynchronize();
+        create_world<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id], image_width, image_height, d_rand_state2[gpu_id]);
+        checkCudaErrors(cudaGetLastError());
+    }
+
+    clock_t start, stop;
+    start = clock();
+    // Render our buffer
+    for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
+        checkCudaErrors(cudaSetDevice(gpu_id));
+        render_init_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(per_gpu_width, per_gpu_height, d_rand_state[gpu_id]);
+        // render_init<<<blocks, threads, 0, streams[gpu_id]>>>(image_width, image_height, d_rand_state[gpu_id], gpu_id, num_gpus);
+    }
+    for (int stream_id = 0; stream_id < num_streams; stream_id++) {
+        checkCudaErrors(cudaStreamSynchronize(streams[stream_id]));
+    }
+    for (int i = 0; i < num_frames_to_render; i++) {
+        for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
+            checkCudaErrors(cudaSetDevice(gpu_id));
+            int x_start = 0, y_start = image_height * gpu_id / num_gpus;
+            render_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(frame_buffer, image_width, image_height, x_start, y_start, per_gpu_width, per_gpu_height,
+                samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id]);
+            checkCudaErrors(cudaGetLastError());
+        }
+        for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
+            checkCudaErrors(cudaStreamSynchronize(streams[gpu_id]));
+        }
+        for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
+            checkCudaErrors(cudaSetDevice(gpu_id));
+            move_cam<<<1, 1, 0, streams[gpu_id]>>>(d_camera[gpu_id]);
+            checkCudaErrors(cudaGetLastError());
+        }
+        for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
+            checkCudaErrors(cudaStreamSynchronize(streams[gpu_id]));
+        }
+    }
+
+    stop = clock();
+    double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
+    std::cerr << "took " << timer_seconds << " seconds to generate " << num_frames_to_render << " frames.\n";
+    std::cerr << "Average FPS: " << (double)num_frames_to_render / timer_seconds << "\n";
+
+    // Output frame_buffer as Image
+    write_frame_buffer(frame_buffer, image_width, image_height, image_width, image_height);
+
+    // clean up
+    for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
+        checkCudaErrors(cudaSetDevice(gpu_id));
+        free_world<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id]);
+        checkCudaErrors(cudaGetLastError());
+        checkCudaErrors(cudaFree(d_camera[gpu_id]));
+        checkCudaErrors(cudaFree(d_world[gpu_id]));
+        checkCudaErrors(cudaFree(d_list[gpu_id]));
+        checkCudaErrors(cudaStreamDestroy(streams[gpu_id]));
+        checkCudaErrors(cudaFree(d_rand_state2[gpu_id]));
+        checkCudaErrors(cudaFree(d_rand_state[gpu_id]));
+    }
+    checkCudaErrors(cudaFree(frame_buffer));
+
+    cudaDeviceReset();
 }
 
 void benchmark_frame(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
@@ -317,11 +433,11 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
 }
 
 // Benchmarks the throughput of a rendering type.
-void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
+void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus) {
     if (strcmp(rendering_strategy.c_str(), "singlenode") == 0) {
         benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render);
     } else if (strcmp(rendering_strategy.c_str(), "tiled") == 0) {
-        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render);
+        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
     } else if (strcmp(rendering_strategy.c_str(), "frame") == 0) {
         benchmark_frame(image_height, image_width, samples_per_pixel, num_frames_to_render);
     }
@@ -338,6 +454,7 @@ int main(int argc, char **argv) {
         std::cout << "-w <int>: width of image in pixels" << std::endl;
         std::cout << "-s <int>: number of samples per pixel" << std::endl;
         std::cout << "-f <int>: number of frames to render" << std::endl;
+        std::cout << "-g <int>: number of gpus to use" << std::endl;
         return 0;
     }
 
@@ -352,6 +469,7 @@ int main(int argc, char **argv) {
     }
 
     int num_frames_to_render = find_int_arg(argc, argv, "-f", 30);
+    int requested_gpus = find_int_arg(argc, argv, "-g", -1);
 
     std::string rendering_strategy = find_string_option(argc, argv, "-r", std::string("singlenode"));
     if (strcmp(rendering_strategy.c_str(), "singlenode") != 0  && strcmp(rendering_strategy.c_str(), "tiled") != 0 && strcmp(rendering_strategy.c_str(), "frame") != 0) {
@@ -359,5 +477,5 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render);
+    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
 }
