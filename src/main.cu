@@ -12,16 +12,17 @@
 #include "cuda_errors.h"
 #include "../common/options.h"
 #include "cuda_runtime.h"
-#include "nccl.h"
+// #include "nccl.h"
+#include <omp.h>
 
-#define NCCLCHECK(cmd) do {                         \
-  ncclResult_t r = cmd;                             \
-  if (r!= ncclSuccess) {                            \
-    printf("Failed, NCCL error %s:%d '%s'\n",             \
-        __FILE__,__LINE__,ncclGetErrorString(r));   \
-    exit(EXIT_FAILURE);                             \
-  }                                                 \
-} while(0)
+// #define NCCLCHECK(cmd) do {                         \
+//   ncclResult_t r = cmd;                             \
+//   if (r!= ncclSuccess) {                            \
+//     printf("Failed, NCCL error %s:%d '%s'\n",             \
+//         __FILE__,__LINE__,ncclGetErrorString(r));   \
+//     exit(EXIT_FAILURE);                             \
+//   }                                                 \
+// } while(0)
 
 // This method determines the color of a ray going through the scene by tracing it through the scene and hitting objects.
 // It has been modified to use CUDA as described below.
@@ -350,13 +351,13 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     std::cerr << "Benchmarking the rendering of " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel ";
     std::cerr << "in " << tx << "x" << ty << " blocks.\n";
 
-    ncclComm_t comms[num_devices];
+    // ncclComm_t comms[num_devices];
 
     //managing X devices
     int nDev = num_devices;
-    int devs[num_devices] = {};
-    for (int i = 0; i < num_devices; i++)
-        devs[i] = i;
+    // int devs[num_devices] = {};
+    // for (int i = 0; i < num_devices; i++)
+    //     devs[i] = i;
 
     //allocating and initializing device buffers
     cudaStream_t* s = (cudaStream_t*)malloc(sizeof(cudaStream_t)*nDev);
@@ -408,41 +409,34 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     }
 
     //initializing NCCL
-    NCCLCHECK(ncclCommInitAll(comms, nDev, devs));
+    // NCCLCHECK(ncclCommInitAll(comms, nDev, devs));
 
     clock_t start, stop;
     start = clock();
 
     dim3 blocks(image_width_dev/tx+1,image_height_dev/ty+1);
     dim3 threads(tx,ty);
+
+    #pragma omp parallel for
     for (int i = 0; i < nDev; ++i) {
         checkCudaErrors(cudaSetDevice(i));
         // Render our buffer
         render_init<<<blocks, threads>>>(image_width_dev, image_height_dev, d_rand_state[i], 0, i*image_height_dev);
-    }
 
-    //synchronizing on CUDA streams to wait for completion of NCCL operation
-    for (int i = 0; i < nDev; ++i) {
         checkCudaErrors(cudaSetDevice(i));
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaStreamSynchronize(s[i]));
-    }
 
-    for (int f = 0; f < num_frames_to_render; f++) {
-        for (int i = 0; i < nDev; ++i) {
+        for (int f = 0; f < num_frames_to_render; f++) {
             checkCudaErrors(cudaSetDevice(i));
             // Render the current frame and make sure it worked.
             render<<<blocks, threads>>>(frame_buffer[i], image_width_dev, image_height_dev, samples_per_pixel, d_camera[i], d_world[i], d_rand_state[i], 0, i*image_height_dev);
-        }
 
-        //synchronizing on CUDA streams to wait for completion of NCCL operation
-        for (int i = 0; i < nDev; ++i) {
+            //synchronizing on CUDA streams to wait for completion of NCCL operation
             checkCudaErrors(cudaSetDevice(i));
             checkCudaErrors(cudaGetLastError());
             checkCudaErrors(cudaStreamSynchronize(s[i]));
-        }
 
-        for (int i = 0; i < nDev; ++i) {
             checkCudaErrors(cudaSetDevice(i));
             // Move the camera to create the next frame.
             move_cam<<<blocks, threads>>>(d_camera[i]);
@@ -473,8 +467,8 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     }
 
     //finalizing NCCL
-    for(int i = 0; i < nDev; ++i)
-        ncclCommDestroy(comms[i]);
+    // for(int i = 0; i < nDev; ++i)
+    //     ncclCommDestroy(comms[i]);
 
     printf("Success \n");
 

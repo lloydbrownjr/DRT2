@@ -3,6 +3,11 @@
 #SBATCH -n 1
 #SBATCH -p GPU-shared
 #SBATCH -t 00:30:00
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 
-./cudart -t 1
+#OpenMP settings:
+export OMP_NUM_THREADS=4
+export OMP_PLACES=cores
+export OMP_PROC_BIND=spread
+
+srun -n 1 -c 4 --cpu_bind=cores ./cudart -t 1 -r tiled
