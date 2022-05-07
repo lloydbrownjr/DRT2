@@ -388,12 +388,6 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
             render_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(frame_buffer, image_width, image_height, x_start, y_start, per_gpu_width, per_gpu_height,
                 samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id]);
             checkCudaErrors(cudaGetLastError());
-        }
-        for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
-            checkCudaErrors(cudaStreamSynchronize(streams[gpu_id]));
-        }
-        for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
-            checkCudaErrors(cudaSetDevice(gpu_id));
             move_cam<<<1, 1, 0, streams[gpu_id]>>>(d_camera[gpu_id]);
             checkCudaErrors(cudaGetLastError());
         }
