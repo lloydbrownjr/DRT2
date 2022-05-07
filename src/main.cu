@@ -431,7 +431,6 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
             checkCudaErrors(cudaGetLastError());
             checkCudaErrors(cudaDeviceSynchronize());
 
-            checkCudaErrors(cudaSetDevice(i));
             // Move the camera to create the next frame.
             move_cam<<<blocks, threads>>>(d_camera[i]);
         }
