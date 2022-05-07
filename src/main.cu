@@ -13,7 +13,7 @@
 #include "../common/options.h"
 #include <vector>
 
-#define num_hitables 22*22 + 1 + 3
+#define num_hitables (22*22 + 1 + 3)
 
 // This method determines the color of a ray going through the scene by tracing it through the scene and hitting objects.
 // It has been modified to use CUDA as described below.
