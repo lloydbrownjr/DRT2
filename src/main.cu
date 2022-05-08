@@ -218,6 +218,53 @@ __global__ void create_world_balanced(hitable **d_list, hitable **d_world, camer
     }
 }
 
+// The goal of this world creation is to make a world that is completely load balanced.
+__global__ void create_world_unbalanced(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        curandState local_rand_state = *rand_state;
+        int i = 0;
+        int xtrans = -20;
+        int ytrans = -20;
+        int width = (int)sqrt((float)num_objs);
+        float xspace = 1;
+        float radius = xspace/2.0;
+
+        int num_layers = 2;
+
+        // MEtal layer.
+        for(int a = -width*xspace; a < width*xspace; a+=xspace) {
+            for(int b = -width/num_layers; b < width/num_layers; b+=xspace) {
+                float choose_mat = RND;
+                vec3 center(a + xtrans, b + ytrans, 0.2);
+                d_list[i++] = new sphere(center, radius, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+            }
+        }
+
+        // Dielectric layer
+        for(int a = -width*xspace; a < width*xspace; a+=xspace) {
+            for(int b = -width/num_layers; b < width/num_layers; b+=xspace) {
+                float choose_mat = RND;
+                vec3 center(a + xtrans, b + ytrans, 0.2 + 2*radius);
+                d_list[i++] = new sphere(center, xspace/2.0, new dielectric(1.5));
+            }
+        }
+        
+        *rand_state = local_rand_state;
+        *d_world  = new hitable_list(d_list, num_objs);
+
+        vec3 lookfrom(0,0,70);
+        vec3 lookat(0,0,0.2);
+        float dist_to_focus = 10.0; (lookfrom-lookat).length();
+        float aperture = 0.1;
+        *d_camera   = new camera(lookfrom,
+                                 lookat,
+                                 vec3(0,1,0),
+                                 30.0,
+                                 float(nx)/float(ny),
+                                 aperture,
+                                 dist_to_focus);
+    }
+}
 
 vec3 camera_move_vector() {
     return vec3(0,0,-0.1);
@@ -310,7 +357,7 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
     //create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
-    create_world_balanced<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+    create_world_unbalanced<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
