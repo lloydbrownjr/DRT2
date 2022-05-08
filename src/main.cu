@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <unordered_map>
 
+#define num_hitables (22*22)
+
 
 #define NCCLCHECK(cmd) do {                         \
   ncclResult_t r = cmd;                             \
@@ -136,14 +138,15 @@ __global__ void render_vec3_t(vec3_t *frame_buffer, int max_x, int max_y, int ns
 
 #define RND (curand_uniform(&local_rand_state))
 
-__global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state) {
+__global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         curandState local_rand_state = *rand_state;
         d_list[0] = new sphere(vec3(0,-1000.0,-1), 1000,
                                new lambertian(vec3(0.5, 0.5, 0.5)));
         int i = 1;
-        for(int a = -11; a < 11; a++) {
-            for(int b = -11; b < 11; b++) {
+        int width = (int)sqrt((float)num_objs);
+        for(int a = -width; a < width; a++) {
+            for(int b = -width; b < width; b++) {
                 float choose_mat = RND;
                 vec3 center(a+RND,0.2,b+RND);
                 if(choose_mat < 0.8f) {
@@ -163,7 +166,7 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
         d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
         d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
         *rand_state = local_rand_state;
-        *d_world  = new hitable_list(d_list, 22*22+1+3);
+        *d_world  = new hitable_list(d_list, num_objs);
 
         vec3 lookfrom(13,2,3);
         vec3 lookat(0,0,0);
@@ -179,6 +182,43 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
     }
 }
 
+// The goal of this world creation is to make a world that is completely load balanced.
+__global__ void create_world_balanced(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        curandState local_rand_state = *rand_state;
+        int i = 0;
+        int xtrans = 35;
+        int width = (int)sqrt((float)num_objs);
+        int xspace = 2;
+        for(int a = -width*xspace + xtrans; a < width*xspace + xtrans; a+=xspace) {
+            for(int b = -width; b < width; b++) {
+                float choose_mat = RND;
+                vec3 center(a, b, 0.2);
+                if (i % 2 == 0) {
+                    d_list[i++] = new sphere(center, 1, new dielectric(1.5));
+                } else {
+                    d_list[i++] = new sphere(center, 1, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+                }
+            }
+        }
+        *rand_state = local_rand_state;
+        *d_world  = new hitable_list(d_list, num_objs);
+
+        vec3 lookfrom(0,0,20);
+        vec3 lookat(0,0,0.2);
+        float dist_to_focus = 10.0; (lookfrom-lookat).length();
+        float aperture = 0.1;
+        *d_camera   = new camera(lookfrom,
+                                 lookat,
+                                 vec3(0,1,0),
+                                 30.0,
+                                 float(nx)/float(ny),
+                                 aperture,
+                                 dist_to_focus);
+    }
+}
+
+
 vec3 camera_move_vector() {
     return vec3(0,0,-0.1);
 }
@@ -191,7 +231,7 @@ __global__ void move_cam(camera **d_camera) {
 }
 
 __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera) {
-    for(int i=0; i < 22*22+1+3; i++) {
+    for(int i=0; i < 22*22; i++) {
         delete ((sphere *)d_list[i])->mat_ptr;
         delete d_list[i];
     }
@@ -264,13 +304,13 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
 
     // make our world of hitables & the camera
     hitable **d_list;
-    int num_hitables = 22*22+1+3;
     checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
     hitable **d_world;
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    //create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    create_world_balanced<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
@@ -333,13 +373,12 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
 
     // make our world of hitables & the camera
     hitable **d_list;
-    int num_hitables = 22*22+1+3;
     checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
     hitable **d_world;
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
@@ -573,7 +612,6 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaMalloc((void **)&d_rand_state2, sizeof(curandState)));
 
     // Allocate world state.
-    int num_hitables = 22*22+1+3;
     hitable **d_list;
     hitable **d_world;
     camera **d_camera;
@@ -593,7 +631,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     MPI_Bcast((void *)d_rand_state2, sizeof(curandState), MPI_BYTE, 0, MPI_COMM_WORLD);
 
     // All ranks create world.
-    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
