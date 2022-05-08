@@ -1,17 +1,22 @@
+#include <float.h>
 #include <iostream>
+#include <map>
 #include <string>
 #include <time.h>
-#include <float.h>
-#include <curand_kernel.h>
-#include "../common/vec3.h"
-#include "../common/ray.h"
-#include "sphere.h"
-#include "hitable_list.h"
-#include "camera.h"
-#include "material.h"
-#include "cuda_errors.h"
-#include "../common/options.h"
+#include <unordered_map>
 #include <vector>
+
+#include <curand_kernel.h>
+#include <mpi.h>
+
+#include "../common/options.h"
+#include "../common/ray.h"
+#include "../common/vec3.h"
+#include "camera.h"
+#include "cuda_errors.h"
+#include "hitable_list.h"
+#include "material.h"
+#include "sphere.h"
 
 #define num_hitables (22*22 + 1 + 3)
 
@@ -421,19 +426,199 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     cudaDeviceReset();
 }
 
-void benchmark_frame(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
-    std::cerr << "Not implemented." << std::endl;
-    exit(1);
+__global__ void update_camera_origin(vec3 new_origin, camera **d_camera) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        (*d_camera)->origin.e[0] = new_origin.x();
+        (*d_camera)->origin.e[1] = new_origin.y();
+        (*d_camera)->origin.e[2] = new_origin.z();
+    }
+}
+
+__global__ void init_camera_origins_for_frames(vec3 *camera_origins_for_frames, int num_frames_to_render, camera **d_camera) {
+    const vec3& current_origin = (*d_camera)->origin;
+    auto move_vector = vec3(0, 0, -0.1);
+    camera_origins_for_frames[0] = vec3(current_origin);
+    for (int i = 1; i < num_frames_to_render; i++) {
+        // Each subsequent frame is offset by the move vector.
+        camera_origins_for_frames[i].e[0] = camera_origins_for_frames[i-1].x() + move_vector.x();
+        camera_origins_for_frames[i].e[1] = camera_origins_for_frames[i-1].y() + move_vector.y();
+        camera_origins_for_frames[i].e[2] = camera_origins_for_frames[i-1].z() + move_vector.z();
+    }
+}
+
+enum message_tag {
+    KILL_SIGNAL,
+    CAMERA_ORIGIN_INFO,
+    FRAME_BUFFER_BACK,
+};
+
+void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
+    int num_procs, rank = 0;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+
+    MPI_Datatype MPI_Vec3;
+    int nitems = 3;
+    int blocklengths[3] = { 1, 1, 1 };
+    MPI_Aint offsets[3];
+    offsets[0] = offsetof(vec3, e[0]);
+    offsets[1] = offsetof(vec3, e[1]);
+    offsets[2] = offsetof(vec3, e[2]);
+    MPI_Datatype types[3] = { MPI_FLOAT, MPI_FLOAT, MPI_FLOAT };
+    MPI_Type_create_struct(nitems, blocklengths, offsets, types, &MPI_Vec3);
+    MPI_Type_commit(&MPI_Vec3);
+
+
+    int num_pixels = image_width * image_height;
+
+    // every machine init random and world
+    curandState *d_rand_state;
+    curandState *d_rand_state2;
+    hitable **d_list;
+    hitable **d_world;
+    camera **d_camera;
+    checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels * sizeof(curandState)));
+    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
+    rand_init<<<1,1>>>(d_rand_state2);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hitable *)));
+    checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
+    checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
+    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    checkCudaErrors(cudaGetLastError());
+
+    vec3 *frame_buffer;
+    checkCudaErrors(cudaMallocManaged((void **)&frame_buffer, num_pixels * sizeof(vec3)));
+
+    vec3 *camera_origins_for_frames;
+    if (rank == 0) {
+        checkCudaErrors(cudaMallocManaged((void **)&camera_origins_for_frames, num_frames_to_render * sizeof(vec3)));
+        init_camera_origins_for_frames<<<1, 1>>>(camera_origins_for_frames, num_frames_to_render, d_camera);
+    }
+
+    int tx = 8;
+    int ty = 8;
+
+    dim3 blocks(image_width/tx + 1, image_height/ty + 1);
+    dim3 threads(tx, ty);
+    render_init_tiled<<<blocks, threads>>>(image_width, image_height, d_rand_state);
+    checkCudaErrors(cudaGetLastError());
+
+    if (rank == 0) {
+        std::vector<int> free_gpus;
+        std::vector<int> remaining_frames;
+        for (int i = 0; i < num_procs; i++) {
+            free_gpus.push_back(i);
+        }
+        for (int i = 0; i < num_frames_to_render; i++) {
+            remaining_frames.push_back(i);
+        }
+
+        std::map<int, int> work_assignment; // frame_id -> gpu_id, ordered on frame_id.
+        // only those in progress are in the work_assignment map.
+        std::unordered_map<int, MPI_Request> work_requests; // gpu_id -> Request
+
+        vec3 **recv_frame_buffer = new vec3 *[num_procs];
+        for (int i = 1; i < num_procs; i++) {
+            recv_frame_buffer[i] = new vec3[num_pixels];
+        }
+
+        MPI_Request ignore;
+
+        while (true) {
+            if (remaining_frames.size() == 0 && free_gpus.size() == num_procs) {
+                // no work to be done and no work to be waited so we kill everyone and get out
+                int signal = 267;
+                for (int other = 1; other < num_procs; other++) {
+                    MPI_Isend(&signal, 1, MPI_INT, other, KILL_SIGNAL, MPI_COMM_WORLD, &ignore);
+                }
+                break;
+            }
+
+            if (remaining_frames.size() == 0 || free_gpus.size() == 0) {
+                // nothing to dispatch, so we wait for incoming stuff
+                // grab information for the first pending frame;
+                int first_frame_in_work = work_assignment.begin()->first;
+                int gpu_for_that = work_assignment[first_frame_in_work];
+
+                if (gpu_for_that == rank) {
+                    checkCudaErrors(cudaDeviceSynchronize());
+                    // data is ready in frame_buffer
+                } else {
+                    MPI_Status status;
+                    MPI_Wait(&work_requests[gpu_for_that], &status);
+                    // data is ready in recv_frame_buffer[gpu_for_that]
+                }
+                work_assignment.erase(first_frame_in_work);
+                free_gpus.push_back(gpu_for_that);
+            }
+
+            auto frame_iter = remaining_frames.begin();
+            int frame = *frame_iter;
+            remaining_frames.erase(frame_iter);
+            int gpu = free_gpus.back();
+            free_gpus.pop_back();
+            work_assignment[frame] = gpu;
+            // pop a frame
+            // pop a gpu
+            vec3 camera_origin = camera_origins_for_frames[frame];
+            if (gpu == rank) {
+                // camera holds camera_origin info
+                update_camera_origin<<<1, 1>>>(camera_origin, d_camera);
+                // update d_camera
+                render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, 0, image_width, image_height,
+                    samples_per_pixel, d_camera, d_world, d_rand_state);
+                // render<<<>>>
+            } else {
+                MPI_Isend(camera_origin.e, 1, MPI_Vec3, gpu, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &ignore);
+                // send camera to remote gpu
+                MPI_Irecv(recv_frame_buffer[gpu], num_pixels, MPI_Vec3, gpu, FRAME_BUFFER_BACK, MPI_COMM_WORLD, &work_requests[gpu]);
+                // recv into corresponding frame_buffer
+            }
+
+        }
+
+    } else {
+        vec3 camera_origin;
+        int signal;
+        MPI_Request requests[2];
+        MPI_Irecv(&signal, 1, MPI_INT, 0, KILL_SIGNAL, MPI_COMM_WORLD, &requests[0]);
+        int which_request;
+        MPI_Status status;
+        while (true) {
+            MPI_Irecv(camera_origin.e, 1, MPI_Vec3, 0, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &requests[1]);
+            MPI_Waitany(2, requests, &which_request, &status);
+            if (which_request == 0) {
+                // signal received
+                if (signal == 267) {
+                    break;
+                }
+            }
+            // get camera origin info
+            update_camera_origin<<<1, 1>>>(camera_origin, d_camera);
+            // update d_camera
+            render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, 0, image_width, image_height,
+                samples_per_pixel, d_camera, d_world, d_rand_state);
+            // render
+            // send back frame
+            MPI_Send(frame_buffer, num_pixels, MPI_Vec3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
+        }
+    }
+
+    MPI_Finalize();
+
 }
 
 // Benchmarks the throughput of a rendering type.
-void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus) {
+void benchmark_rendering(int argc, char **argv, std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus) {
     if (strcmp(rendering_strategy.c_str(), "singlenode") == 0) {
         benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render);
     } else if (strcmp(rendering_strategy.c_str(), "tiled") == 0) {
         benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
     } else if (strcmp(rendering_strategy.c_str(), "frame") == 0) {
-        benchmark_frame(image_height, image_width, samples_per_pixel, num_frames_to_render);
+        benchmark_frame(argc, argv, image_height, image_width, samples_per_pixel, num_frames_to_render);
     }
 }
 
@@ -471,5 +656,5 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
+    benchmark_rendering(argc, argv, rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
 }
