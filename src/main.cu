@@ -448,36 +448,22 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
         }
     }
 
-    // Allocate random state.
+    // every machine init random and world
     curandState *d_rand_state;
     curandState *d_rand_state2;
-    checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels*sizeof(curandState)));
-    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, sizeof(curandState)));
-
-    // Allocate world state.
-    int num_hitables = 22*22+1+3;
     hitable **d_list;
     hitable **d_world;
     camera **d_camera;
-    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
+    checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels * sizeof(curandState)));
+    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
+    rand_init<<<1, 1>>>(d_rand_state2);
+    checkCudaErrors(cudaGetLastError());
+    int num_hitables = 22*22+1+3;
+    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hitable *)));
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-
-    // Generate and broadcast random state from rank 0 to all ranks.
-    if (myRank == 0) {
-        // Generate.
-        rand_init<<<1,1>>>(d_rand_state2);
-        checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaDeviceSynchronize());
-    }
-
-    // Broadcast.
-    MPI_Bcast((void *)d_rand_state2, sizeof(curandState), MPI_BYTE, RAND_STATE, MPI_COMM_WORLD);
-
-    // All ranks create world.
-    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
     checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
 
     std::cerr << "START ";
     clock_t start, stop;
