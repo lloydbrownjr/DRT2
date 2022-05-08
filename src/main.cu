@@ -316,7 +316,7 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     cudaDeviceReset();
 }
 
-void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_gpus = -1) {
+void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_gpus = -1, int tiling = 1) {
     int tx = 8;
     int ty = 8;
 
@@ -341,7 +341,12 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     int num_streams = num_gpus;
     
     int per_gpu_width = image_width;
-    int per_gpu_height = image_height / num_gpus;
+    int per_gpu_height = image_height;
+    if (tiling == 0) { // vertical, good load balancing for picture
+        per_gpu_width /= num_gpus;
+    } else { // horizontal, bad loading balancing for picture
+        per_gpu_height /= num_gpus;
+    }
     int num_pixels_per_gpu = per_gpu_width * per_gpu_height;
 
     dim3 blocks(per_gpu_width / tx + 1, per_gpu_height / ty + 1);
@@ -384,7 +389,12 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     for (int i = 0; i < num_frames_to_render; i++) {
         for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
             checkCudaErrors(cudaSetDevice(gpu_id));
-            int x_start = 0, y_start = image_height * gpu_id / num_gpus;
+            int x_start, y_start = 0;
+            if (tiling == 0) {
+                x_start = image_width * gpu_id / num_gpus;
+            } else {
+                y_start = image_height * gpu_id / num_gpus;
+            }
             render_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(frame_buffer, image_width, image_height, x_start, y_start, per_gpu_width, per_gpu_height,
                 samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id]);
             checkCudaErrors(cudaGetLastError());
@@ -427,11 +437,11 @@ void benchmark_frame(int image_height, int image_width, int samples_per_pixel, i
 }
 
 // Benchmarks the throughput of a rendering type.
-void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus) {
+void benchmark_rendering(std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus, int tiling) {
     if (strcmp(rendering_strategy.c_str(), "singlenode") == 0) {
         benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render);
     } else if (strcmp(rendering_strategy.c_str(), "tiled") == 0) {
-        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
+        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus, tiling);
     } else if (strcmp(rendering_strategy.c_str(), "frame") == 0) {
         benchmark_frame(image_height, image_width, samples_per_pixel, num_frames_to_render);
     }
@@ -449,6 +459,7 @@ int main(int argc, char **argv) {
         std::cout << "-s <int>: number of samples per pixel" << std::endl;
         std::cout << "-f <int>: number of frames to render" << std::endl;
         std::cout << "-g <int>: number of gpus to use" << std::endl;
+        std::cout << "-p <int>: tiling, 0 = vertical (good load balancing for picture), 1 = horizontal (bad load balancing for picture)" << std::endl;
         return 0;
     }
 
@@ -464,6 +475,7 @@ int main(int argc, char **argv) {
 
     int num_frames_to_render = find_int_arg(argc, argv, "-f", 30);
     int requested_gpus = find_int_arg(argc, argv, "-g", -1);
+    int tiling = find_int_arg(argc, argv, "-p", 1);
 
     std::string rendering_strategy = find_string_option(argc, argv, "-r", std::string("singlenode"));
     if (strcmp(rendering_strategy.c_str(), "singlenode") != 0  && strcmp(rendering_strategy.c_str(), "tiled") != 0 && strcmp(rendering_strategy.c_str(), "frame") != 0) {
@@ -471,5 +483,5 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
+    benchmark_rendering(rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus, tiling);
 }
