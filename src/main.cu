@@ -76,19 +76,20 @@ __global__ void rand_init(curandState *rand_state) {
     }
 }
 
-__global__ void render_init(int max_x, int max_y, curandState *rand_state, int init_x, int init_y) {
-    int i_local = threadIdx.x + blockIdx.x * blockDim.x;
-    int j_local = threadIdx.y + blockIdx.y * blockDim.y;
-    int i = i_local + init_x;
-    int j = j_local + init_y;
-    if((i >= max_x) || (j >= max_y)) return;
-    int pixel_index = j*max_x + i;
-    int pixel_index_local = j_local*max_x + i_local;
+__global__ void render_init_tiled(int x_range, int y_range, curandState *rand_state) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if (i >= x_range || j >= y_range) {
+        return;
+    }
+
+    int pixel_index = j * x_range + i;
     // Original: Each thread gets same seed, a different sequence number, no offset
     // curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
     // BUGFIX, see Issue#2: Each thread gets different seed, same sequence for
     // performance improvement of about 2x!
-    curand_init(1984+pixel_index, 0, 0, &rand_state[pixel_index_local]);
+    curand_init(1984+pixel_index, 0, 0, &rand_state[pixel_index]);
 }
 
 __global__ void render(vec3 *frame_buffer, int max_x, int max_y, int ns, camera **cam, hitable **world, curandState *rand_state, int init_x, int init_y) {
@@ -280,7 +281,7 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
     // Render our buffer
     dim3 blocks(image_width/tx+1,image_height/ty+1);
     dim3 threads(tx,ty);
-    render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state, 0, 0);
+    render_init_tiled<<<blocks, threads>>>(image_width, image_height, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     render<<<blocks, threads>>>(frame_buffer, image_width, image_height, samples_per_pixel, d_camera, d_world, d_rand_state, 0, 0);
@@ -349,7 +350,7 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     // Render our buffer
     dim3 blocks(image_width/tx+1,image_height/ty+1);
     dim3 threads(tx,ty);
-    render_init<<<blocks, threads>>>(image_width, image_height, d_rand_state, 0, 0);
+    render_init_tiled<<<blocks, threads>>>(image_width, image_height, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     for (int i = 0; i < num_frames_to_render; i++) {
@@ -396,6 +397,11 @@ enum message_tag {
     CAMERA_ORIGIN_INFO,
     FRAME_BUFFER_BACK,
 };
+
+__global__ void init_camera_origin(vec3 camera_origin, camera **d_camera) {
+    const vec3& current_origin = (*d_camera)->origin;
+    camera_origin = vec3(current_origin);
+}
 
 void benchmark_tiled(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
     int tx = 8;
@@ -471,7 +477,7 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     dim3 blocks(image_width_dev/tx+1,image_height_dev/ty+1);
     dim3 threads(tx,ty);
     // Render our buffer
-    render_init<<<blocks, threads>>>(image_width_dev, image_height_dev, d_rand_state, 0, myRank*image_height_dev);
+    render_init_tiled<<<blocks, threads>>>(image_width_dev, image_height_dev, d_rand_state);
 
     //synchronizing on CUDA streams to wait for completion of NCCL operation
     checkCudaErrors(cudaGetLastError());
@@ -484,8 +490,9 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
         std::cerr << "HELLO ";
         // send and recv camera and rand state
         if (myRank == 0) {
+            init_camera_origin<<<1, 1>>>(camera_origin, d_camera);
             for (int i = 1; i < nRanks; ++i) {
-                MPI_Send(&((*d_camera)->origin.e), 1, MPI_Vec3, i, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD);
+                MPI_Send(camera_origin.e, 1, MPI_Vec3, i, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD);
             }
         } else {
             MPI_Status status;
