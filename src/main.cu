@@ -453,11 +453,15 @@ enum message_tag {
 };
 
 void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
-    int num_procs, rank = 0;
+    int num_procs, rank;
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+    if (rank == 0) {
+        std::cerr << "Benchmarking the rendering of " << num_frames_to_render << " " << image_width << "x" << image_height << " images with " << samples_per_pixel << " samples per pixel " << std::endl;
+        std::cerr << "num_procs: " << num_procs << std::endl;
+    }
 
     MPI_Datatype MPI_Vec3;
     int nitems = 3;
@@ -470,6 +474,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     MPI_Type_create_struct(nitems, blocklengths, offsets, types, &MPI_Vec3);
     MPI_Type_commit(&MPI_Vec3);
 
+    checkCudaErrors(cudaSetDevice(rank));
 
     int num_pixels = image_width * image_height;
 
@@ -481,12 +486,12 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels * sizeof(curandState)));
     checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
-    rand_init<<<1,1>>>(d_rand_state2);
+    rand_init<<<1, 1>>>(d_rand_state2);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hitable *)));
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
     checkCudaErrors(cudaGetLastError());
 
     vec3 *frame_buffer;
@@ -496,6 +501,11 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     if (rank == 0) {
         checkCudaErrors(cudaMallocManaged((void **)&camera_origins_for_frames, num_frames_to_render * sizeof(vec3)));
         init_camera_origins_for_frames<<<1, 1>>>(camera_origins_for_frames, num_frames_to_render, d_camera);
+    }
+
+    clock_t start, stop;
+    if (rank == 0) {
+        start = clock();
     }
 
     int tx = 8;
@@ -534,6 +544,10 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                 for (int other = 1; other < num_procs; other++) {
                     MPI_Isend(&signal, 1, MPI_INT, other, KILL_SIGNAL, MPI_COMM_WORLD, &ignore);
                 }
+                for (int i = 1; i < num_procs; i++) {
+                    delete[] recv_frame_buffer[i];
+                }
+                delete[] recv_frame_buffer;
                 break;
             }
 
@@ -553,6 +567,9 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                 }
                 work_assignment.erase(first_frame_in_work);
                 free_gpus.push_back(gpu_for_that);
+                if (remaining_frames.size() == 0) {
+                    continue;
+                }
             }
 
             auto frame_iter = remaining_frames.begin();
@@ -606,6 +623,24 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             MPI_Send(frame_buffer, num_pixels, MPI_Vec3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
         }
     }
+
+    if (rank == 0) {
+        stop = clock();
+        double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
+        std::cerr << "took " << timer_seconds << " seconds to generate " << num_frames_to_render << " frames.\n";
+        std::cerr << "Average FPS: " << (double)num_frames_to_render / timer_seconds << "\n";
+    }
+
+    if (rank == 0) {
+        checkCudaErrors(cudaFree(camera_origins_for_frames));
+    }
+    checkCudaErrors(cudaFree(frame_buffer));
+    free_world<<<1, 1>>>(d_list, d_world, d_camera);
+    checkCudaErrors(cudaFree(d_camera));
+    checkCudaErrors(cudaFree(d_world));
+    checkCudaErrors(cudaFree(d_list));
+    checkCudaErrors(cudaFree(d_rand_state2));
+    checkCudaErrors(cudaFree(d_rand_state));
 
     MPI_Finalize();
 
