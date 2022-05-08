@@ -398,9 +398,12 @@ enum message_tag {
     FRAME_BUFFER_BACK,
 };
 
-__global__ void init_camera_origin(vec3 camera_origin, camera **d_camera) {
+__global__ void init_camera_origin(vec3 *camera_origin, camera **d_camera) {
     const vec3& current_origin = (*d_camera)->origin;
-    camera_origin = vec3(current_origin);
+    vec3 temp = vec3(current_origin);
+    camera_origin->e[0] = temp.x();
+    camera_origin->e[1] = temp.y();
+    camera_origin->e[2] = temp.z();
 }
 
 void benchmark_tiled(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
@@ -490,7 +493,7 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
         std::cerr << "HELLO ";
         // send and recv camera and rand state
         if (myRank == 0) {
-            init_camera_origin<<<1, 1>>>(camera_origin, d_camera);
+            init_camera_origin<<<1, 1>>>(&camera_origin, d_camera);
             for (int i = 1; i < nRanks; ++i) {
                 MPI_Send(camera_origin.e, 1, MPI_Vec3, i, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD);
             }
@@ -501,13 +504,14 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
             // Update camera origin for the frame.
             update_camera_origin<<<1,1>>>(camera_origin, d_camera);
         }
+        checkCudaErrors(cudaGetLastError());
+        checkCudaErrors(cudaDeviceSynchronize());
+
         std::cerr << "HELLO ";
 
         // Render the current frame and make sure it worked.
         render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, myRank*image_height_dev, image_width_dev, image_height_dev, samples_per_pixel, d_camera, d_world, d_rand_state);
-        //synchronizing on CUDA streams to wait for completion of NCCL operation
-        checkCudaErrors(cudaGetLastError());
-        checkCudaErrors(cudaDeviceSynchronize());
+        
         std::cerr << "HELLO ";
 
         if (myRank == 0) {
@@ -517,18 +521,18 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
             std::cerr << "HELLO ";
             // Recieve frame
             MPI_Request requests[nRanks];
-            for (int i = 1; i < nRanks; ++i) {
+            for (int i = 0; i < nRanks; ++i) {
                 MPI_Irecv(frame_buffer_all[i], frame_buffer_size_dev, MPI_Vec3, i, FRAME_BUFFER_BACK, MPI_COMM_WORLD, &requests[i]);
             }
             
             std::cerr << "HELLO ";
 
-            frame_buffer_all[0] = frame_buffer;
-            // MPI_Send(frame_buffer, frame_buffer_size_dev, MPI_Vec3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
+            // frame_buffer_all[0] = frame_buffer;
+            MPI_Send(frame_buffer, frame_buffer_size_dev, MPI_Vec3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
 
             std::cerr << "HELLO ";
 
-            for (int i = 1; i < nRanks; ++i) {
+            for (int i = 0; i < nRanks; ++i) {
                 MPI_Status status;
                 MPI_Wait(&requests[i], &status);
             }
