@@ -12,8 +12,8 @@
 #include "cuda_errors.h"
 #include "../common/options.h"
 #include "cuda_runtime.h"
-#include "nccl.h"
-#include "mpi.h"
+// #include "nccl.h"
+#include "/opt/packages/mvapich2/intel/2.3.5-intel20.4/include/mpi.h"
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -385,25 +385,18 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     cudaDeviceReset();
 }
 
-static uint64_t getHostHash(const char* string) {
-  // Based on DJB2a, result = result * 33 ^ char
-  uint64_t result = 5381;
-  for (int c = 0; string[c] != '\0'; c++){
-    result = ((result << 5) + result) ^ string[c];
-  }
-  return result;
+// Moves camera origin based on input vector.
+__global__ void update_camera_origin(vec3_t* new_origin, camera** d_camera) {
+    (*d_camera)->origin.e[0] = new_origin->x;
+    (*d_camera)->origin.e[1] = new_origin->y;
+    (*d_camera)->origin.e[2] = new_origin->z;
 }
 
-
-static void getHostName(char* hostname, int maxlen) {
-  gethostname(hostname, maxlen);
-  for (int i=0; i< maxlen; i++) {
-    if (hostname[i] == '.') {
-        hostname[i] = '\0';
-        return;
-    }
-  }
-}
+enum message_tag {
+    RAND_STATE,
+    CAMERA_ORIGIN_INFO,
+    FRAME_BUFFER_BACK,
+};
 
 void benchmark_tiled(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
     int tx = 8;
@@ -430,32 +423,6 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     MPI_Type_create_struct(nitems, blocklengths, offsets, types, &VEC3);
     MPI_Type_commit(&VEC3);
 
-    //calculating localRank based on hostname which is used in selecting a GPU
-    uint64_t hostHashs[nRanks];
-    char hostname[1024];
-    getHostName(hostname, 1024);
-    hostHashs[myRank] = getHostHash(hostname);
-    MPICHECK(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, hostHashs, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
-    for (int p=0; p<nRanks; p++) {
-        if (p == myRank) break;
-        if (hostHashs[p] == hostHashs[myRank]) localRank++;
-    }
-
-    ncclUniqueId id;
-    ncclComm_t comm;
-    // float *sendbuff, *recvbuff;
-    cudaStream_t s;
-
-    //get NCCL unique ID at rank 0 and broadcast it to all others
-    if (myRank == 0) ncclGetUniqueId(&id);
-    MPICHECK(MPI_Bcast((void *)&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
-
-    //picking a GPU based on localRank, allocate device buffers
-    checkCudaErrors(cudaSetDevice(localRank));
-    // CUDACHECK(cudaMalloc(&sendbuff, size * sizeof(float)));
-    // CUDACHECK(cudaMalloc(&recvbuff, size * sizeof(float)));
-    checkCudaErrors(cudaStreamCreate(&s));
-
     int num_pixels = image_width*image_height;
     size_t frame_buffer_size = num_pixels*sizeof(vec3_t);
 
@@ -475,36 +442,43 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     if (myRank == 0) {
         frame_buffer_all = (vec3_t**)malloc(nRanks * sizeof(vec3_t*));
         for (int i = 0; i < nRanks; ++i) {
-            frame_buffer_all[i] = (vec3_t*)malloc(frame_buffer_size_dev * sizeof(vec3_t));
+            // frame_buffer_all[i] = (vec3_t*)malloc(frame_buffer_size_dev * sizeof(vec3_t));
+            checkCudaErrors(cudaMallocManaged((void **)&frame_buffer_all[i], frame_buffer_size_dev));
         }
     }
 
-    // allocate random state
+    // Allocate random state.
     curandState *d_rand_state;
-    checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels_dev*sizeof(curandState)));
     curandState *d_rand_state2;
-    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, 1*sizeof(curandState)));
+    checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels*sizeof(curandState)));
+    checkCudaErrors(cudaMalloc((void **)&d_rand_state2, sizeof(curandState)));
 
-    // we need that 2nd random state to be initialized for the world creation
-    rand_init<<<1,1>>>(d_rand_state2);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize());
-
-    // make our world of hitables & the camera
-    hitable **d_list;
+    // Allocate world state.
     int num_hitables = 22*22+1+3;
-    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
+    hitable **d_list;
     hitable **d_world;
-    checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
+    checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables*sizeof(hitable *)));
+    checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
+
+    // Generate and broadcast random state from rank 0 to all ranks.
+    if (myRank == 0) {
+        // Generate.
+        rand_init<<<1,1>>>(d_rand_state2);
+        checkCudaErrors(cudaGetLastError());
+        checkCudaErrors(cudaDeviceSynchronize());
+    }
+
+    // Broadcast.
+    MPI_Bcast((void *)d_rand_state2, sizeof(curandState), MPI_BYTE, RAND_STATE, MPI_COMM_WORLD);
+
+    // All ranks create world.
     create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
-    //initializing NCCL
-    NCCLCHECK(ncclCommInitRank(&comm, nRanks, id, myRank));
-
+    std::cerr << "START ";
     clock_t start, stop;
     start = clock();
 
@@ -517,26 +491,62 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
+    // Stores the camera origins from the root.
+    vec3_t camera_origin = {0,0,0};
+
     for (int f = 0; f < num_frames_to_render; f++) {
+        std::cerr << "HELLO ";
+        // send and recv camera and rand state
+        if (myRank == 0) {
+            for (int i = 1; i < nRanks; ++i) {
+                MPI_Send(&((*d_camera)->origin), 1, VEC3, i, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD);
+            }
+        } else {
+            MPI_Status status;
+            // Attempt to receive the camera origin for the frame.
+            MPI_Recv(&camera_origin, 1, VEC3, 0, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &status);
+            // Update camera origin for the frame.
+            update_camera_origin<<<1,1>>>(&camera_origin, d_camera);
+        }
+        std::cerr << "HELLO ";
+
         // Render the current frame and make sure it worked.
         render_vec3_t<<<blocks, threads>>>(frame_buffer, image_width_dev, image_height_dev, samples_per_pixel, d_camera, d_world, d_rand_state, 0, myRank*image_height_dev);
 
         //synchronizing on CUDA streams to wait for completion of NCCL operation
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaDeviceSynchronize());
+        std::cerr << "HELLO ";
 
-        // Move the camera to create the next frame.
-        move_cam<<<blocks, threads>>>(d_camera);
-    }
+        if (myRank == 0) {
+            // Move the camera to create the next frame.
+            move_cam<<<blocks, threads>>>(d_camera);
 
-    ncclGroupStart();
-    if (myRank == 0) {
-        for (int i = 0; i < nRanks; ++i) {
-            ncclRecv(frame_buffer_all[i], num_pixels_dev, ncclChar, i, comm, s);
+            std::cerr << "HELLO ";
+            // Recieve frame
+            MPI_Request requests[nRanks];
+            for (int i = 1; i < nRanks; ++i) {
+                MPI_Irecv(frame_buffer_all[i], frame_buffer_size_dev, VEC3, i, FRAME_BUFFER_BACK, MPI_COMM_WORLD, &requests[i]);
+            }
+            
+            std::cerr << "HELLO ";
+
+            frame_buffer_all[0] = frame_buffer;
+            // MPI_Send(frame_buffer, frame_buffer_size_dev, VEC3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
+
+            std::cerr << "HELLO ";
+
+            for (int i = 1; i < nRanks; ++i) {
+                MPI_Status status;
+                MPI_Wait(&requests[i], &status);
+            }
+            std::cerr << "HELLO ";
+        } else {
+            // Send the frame back to the root.
+            MPI_Send(frame_buffer, frame_buffer_size_dev, VEC3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
         }
+        std::cerr << "HELLO ";
     }
-    ncclSend(frame_buffer, num_pixels_dev, ncclChar, 0, comm, s);
-    ncclGroupEnd();
 
     stop = clock();
     double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
@@ -559,9 +569,6 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaFree(d_rand_state));
     checkCudaErrors(cudaFree(d_rand_state2));
     checkCudaErrors(cudaFree(frame_buffer));
-
-    //finalizing NCCL
-    ncclCommDestroy(comm);
 
     //finalizing MPI
     MPICHECK(MPI_Finalize());
