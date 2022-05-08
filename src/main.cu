@@ -38,8 +38,6 @@
   }                                                 \
 } while(0)
 
-MPI_Datatype VEC3;
-
 // This method determines the color of a ray going through the scene by tracing it through the scene and hitting objects.
 // It has been modified to use CUDA as described below.
 // Matching the C++ code would recurse enough into color() calls that
@@ -117,30 +115,28 @@ __global__ void render(vec3 *frame_buffer, int max_x, int max_y, int ns, camera 
     frame_buffer[pixel_index_local] = col;
 }
 
-__global__ void render_vec3_t(vec3_t *frame_buffer, int max_x, int max_y, int ns, camera **cam, hitable **world, curandState *rand_state, int init_x, int init_y) {
-    int i_local = threadIdx.x + blockIdx.x * blockDim.x + init_x;
-    int j_local = threadIdx.y + blockIdx.y * blockDim.y + init_y;
-    int i = i_local + init_x;
-    int j = j_local + init_y;
-    if((i >= max_x) || (j >= max_y)) return;
-    // int pixel_index = j*max_x + i;
-    int pixel_index_local = j_local*max_x + i_local;
-    curandState local_rand_state = rand_state[pixel_index_local];
-    vec3_t col{0,0,0};
-    for(int s=0; s < ns; s++) {
-        float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
-        float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
-        ray r = (*cam)->get_ray(u, v, &local_rand_state);
-        auto col_addition = color(r, world, &local_rand_state);
-        col.x += col_addition.x();
-        col.y += col_addition.y();
-        col.z += col_addition.z();
+__global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_height, int x_start, int y_start, int x_range, int y_range,
+        int number_samples, camera **cam, hitable **world, curandState *rand_state) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    if (i >= x_range || j >= y_range) {
+        return;
     }
-    rand_state[pixel_index_local] = local_rand_state;
-    col.x = sqrt(col.x / float(ns));
-    col.y = sqrt(col.y / float(ns));
-    col.z = sqrt(col.z / float(ns));
-    frame_buffer[pixel_index_local] = col;
+    int local_index = j * x_range + i;
+    curandState local_rand_state = rand_state[local_index];
+    int pixel_x = x_start + i;
+    int pixel_y = y_start + j;
+    int pixel_index = pixel_y * image_width + pixel_x;
+    vec3 col(0, 0, 0);
+    for(int sample = 0; sample < number_samples; sample++) {
+        float u = float(pixel_x + curand_uniform(&local_rand_state)) / float(image_width);
+        float v = float(pixel_y + curand_uniform(&local_rand_state)) / float(image_height);
+        ray r = (*cam)->get_ray(u, v, &local_rand_state);
+        col += color(r, world, &local_rand_state);
+    }
+    rand_state[local_index] = local_rand_state;
+    col /= float(number_samples);
+    frame_buffer[pixel_index] = col.getsqrt();
 }
 
 #define RND (curand_uniform(&local_rand_state))
@@ -222,7 +218,7 @@ void write_frame_buffer(vec3 *frame_buffer, int nx, int ny, int max_x, int max_y
 }
 
 // Writes the image to a ppm file.
-void write_frame_buffer_arr(vec3_t **frame_buffer_arr, int nx, int ny, int max_x, int max_y) {
+void write_frame_buffer_arr(vec3 **frame_buffer_arr, int nx, int ny, int max_x, int max_y) {
     int size = sizeof frame_buffer_arr / sizeof frame_buffer_arr[0];
     int slice_height = max_y/size;
     FILE *f = fopen("output.ppm", "w");
@@ -230,10 +226,10 @@ void write_frame_buffer_arr(vec3_t **frame_buffer_arr, int nx, int ny, int max_x
     for(int j=0; j < max_y; j++) {
         for(int i=0; i < max_x; i++) {
             int slice = j/slice_height;
-            vec3_t col = frame_buffer_arr[slice][(j-(slice*slice_height))*max_x + i];
-            int ir = int(255.99*col.x);
-            int ig = int(255.99*col.y);
-            int ib = int(255.99*col.z);
+            vec3 col = frame_buffer_arr[slice][(j-(slice*slice_height))*max_x + i];
+            int ir = int(255.99*col[0]);
+            int ig = int(255.99*col[1]);
+            int ib = int(255.99*col[2]);
             fprintf(f, "%d %d %d ", ir, ig, ib);
         }
         fprintf(f, "\n");
@@ -387,10 +383,12 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
 }
 
 // Moves camera origin based on input vector.
-__global__ void update_camera_origin(vec3_t* new_origin, camera** d_camera) {
-    (*d_camera)->origin.e[0] = new_origin->x;
-    (*d_camera)->origin.e[1] = new_origin->y;
-    (*d_camera)->origin.e[2] = new_origin->z;
+__global__ void update_camera_origin(vec3 new_origin, camera **d_camera) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        (*d_camera)->origin.e[0] = new_origin.x();
+        (*d_camera)->origin.e[1] = new_origin.y();
+        (*d_camera)->origin.e[2] = new_origin.z();
+    }
 }
 
 enum message_tag {
@@ -414,18 +412,19 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     MPICHECK(MPI_Comm_size(MPI_COMM_WORLD, &nRanks));
 
     // Create MPI Vec3 Type.
-    const int nitems = 3;
-    int blocklengths[3] = {1, 1, 1};
-    MPI_Datatype types[7] = {MPI_FLOAT, MPI_FLOAT, MPI_FLOAT};
+    MPI_Datatype MPI_Vec3;
+    int nitems = 3;
+    int blocklengths[3] = { 1, 1, 1 };
     MPI_Aint offsets[3];
-    offsets[0] = offsetof(vec3_t, x);
-    offsets[1] = offsetof(vec3_t, y);
-    offsets[2] = offsetof(vec3_t, z);
-    MPI_Type_create_struct(nitems, blocklengths, offsets, types, &VEC3);
-    MPI_Type_commit(&VEC3);
+    offsets[0] = offsetof(vec3, e[0]);
+    offsets[1] = offsetof(vec3, e[1]);
+    offsets[2] = offsetof(vec3, e[2]);
+    MPI_Datatype types[3] = { MPI_FLOAT, MPI_FLOAT, MPI_FLOAT };
+    MPI_Type_create_struct(nitems, blocklengths, offsets, types, &MPI_Vec3);
+    MPI_Type_commit(&MPI_Vec3);
 
     int num_pixels = image_width*image_height;
-    size_t frame_buffer_size = num_pixels*sizeof(vec3_t);
+    size_t frame_buffer_size = num_pixels*sizeof(vec3);
 
     int image_width_dev = image_width;
     int image_height_dev = image_height / nRanks;
@@ -437,13 +436,13 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     size_t frame_buffer_size_dev = frame_buffer_size / nRanks;
 
     // allocate frame_buffer
-    vec3_t *frame_buffer;
+    vec3 *frame_buffer;
     checkCudaErrors(cudaMallocManaged((void **)&frame_buffer, frame_buffer_size_dev));
-    vec3_t** frame_buffer_all;
+    vec3** frame_buffer_all;
     if (myRank == 0) {
-        frame_buffer_all = (vec3_t**)malloc(nRanks * sizeof(vec3_t*));
+        frame_buffer_all = (vec3**)malloc(nRanks * sizeof(vec3*));
         for (int i = 0; i < nRanks; ++i) {
-            // frame_buffer_all[i] = (vec3_t*)malloc(frame_buffer_size_dev * sizeof(vec3_t));
+            // frame_buffer_all[i] = (vec3*)malloc(frame_buffer_size_dev * sizeof(vec3));
             checkCudaErrors(cudaMallocManaged((void **)&frame_buffer_all[i], frame_buffer_size_dev));
         }
     }
@@ -479,27 +478,26 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaDeviceSynchronize());
 
     // Stores the camera origins from the root.
-    vec3_t camera_origin = {0,0,0};
+    vec3 camera_origin = {0,0,0};
 
     for (int f = 0; f < num_frames_to_render; f++) {
         std::cerr << "HELLO ";
         // send and recv camera and rand state
         if (myRank == 0) {
             for (int i = 1; i < nRanks; ++i) {
-                MPI_Send(&((*d_camera)->origin), 1, VEC3, i, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD);
+                MPI_Send(&((*d_camera)->origin.e), 1, MPI_Vec3, i, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD);
             }
         } else {
             MPI_Status status;
             // Attempt to receive the camera origin for the frame.
-            MPI_Recv(&camera_origin, 1, VEC3, 0, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &status);
+            MPI_Recv(&camera_origin, 1, MPI_Vec3, 0, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &status);
             // Update camera origin for the frame.
-            update_camera_origin<<<1,1>>>(&camera_origin, d_camera);
+            update_camera_origin<<<1,1>>>(camera_origin, d_camera);
         }
         std::cerr << "HELLO ";
 
         // Render the current frame and make sure it worked.
-        render_vec3_t<<<blocks, threads>>>(frame_buffer, image_width_dev, image_height_dev, samples_per_pixel, d_camera, d_world, d_rand_state, 0, myRank*image_height_dev);
-
+        render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, myRank*image_height_dev, image_width_dev, image_height_dev, samples_per_pixel, d_camera, d_world, d_rand_state);
         //synchronizing on CUDA streams to wait for completion of NCCL operation
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaDeviceSynchronize());
@@ -513,13 +511,13 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
             // Recieve frame
             MPI_Request requests[nRanks];
             for (int i = 1; i < nRanks; ++i) {
-                MPI_Irecv(frame_buffer_all[i], frame_buffer_size_dev, VEC3, i, FRAME_BUFFER_BACK, MPI_COMM_WORLD, &requests[i]);
+                MPI_Irecv(frame_buffer_all[i], frame_buffer_size_dev, MPI_Vec3, i, FRAME_BUFFER_BACK, MPI_COMM_WORLD, &requests[i]);
             }
             
             std::cerr << "HELLO ";
 
             frame_buffer_all[0] = frame_buffer;
-            // MPI_Send(frame_buffer, frame_buffer_size_dev, VEC3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
+            // MPI_Send(frame_buffer, frame_buffer_size_dev, MPI_Vec3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
 
             std::cerr << "HELLO ";
 
@@ -530,7 +528,7 @@ void benchmark_tiled(int argc, char **argv, int image_height, int image_width, i
             std::cerr << "HELLO ";
         } else {
             // Send the frame back to the root.
-            MPI_Send(frame_buffer, frame_buffer_size_dev, VEC3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
+            MPI_Send(frame_buffer, frame_buffer_size_dev, MPI_Vec3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
         }
         std::cerr << "HELLO ";
     }
