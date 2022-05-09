@@ -583,7 +583,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
     
     if (num_procs < 2) {
-        std::cerr << "This program requires at least 2 processes.\n";
+        std::cerr << "!!!!!!!!Hey you, you only used 1 process. When you run framed we use 1 mpi task per gpu and an extra mpi task to dispatch work. So if you want to run with 1 GPU use -N 2, if you want to run with 2 GPUs use -N 3 etc.\n";
         exit(1);
     }
 
