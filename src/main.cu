@@ -19,7 +19,11 @@
 #include "material.h"
 #include "sphere.h"
 
-#define num_hitables (22*22 + 1 + 3)
+static int num_hitables = (22*22 + 1 + 3);
+
+#define NORMAL 0
+#define UNBALANCED 1
+#define BALANCED 2
 
 // This method determines the color of a ray going through the scene by tracing it through the scene and hitting objects.
 // It has been modified to use CUDA as described below.
@@ -101,7 +105,7 @@ __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_heig
 
 #define RND (curand_uniform(&local_rand_state))
 
-__global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state) {
+__global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         curandState local_rand_state = *rand_state;
         d_list[0] = new sphere(vec3(0, -1000, -1), 1000,
@@ -128,10 +132,94 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
         d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
         d_list[i++] = new sphere(vec3(4, 1, 0),  1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
         *rand_state = local_rand_state;
-        *d_world  = new hitable_list(d_list, num_hitables);
+        *d_world  = new hitable_list(d_list, num_objs);
 
         vec3 lookfrom(13, 2, 3);
         vec3 lookat(0,0,0);
+        float dist_to_focus = 10.0; (lookfrom-lookat).length();
+        float aperture = 0.1;
+        *d_camera   = new camera(lookfrom,
+                                 lookat,
+                                 vec3(0,1,0),
+                                 30.0,
+                                 float(nx)/float(ny),
+                                 aperture,
+                                 dist_to_focus);
+    }
+}
+
+// The goal of this world creation is to make a world that is completely load balanced.
+__global__ void create_world_balanced(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        curandState local_rand_state = *rand_state;
+        int i = 0;
+        int xtrans = 35;
+        int width = (int)sqrt((float)num_objs);
+        int xspace = 2;
+        for(int a = -width*xspace + xtrans; a < width*xspace + xtrans; a+=xspace) {
+            for(int b = -width; b < width; b++) {
+                float choose_mat = RND;
+                vec3 center(a, b, 0.2);
+                if (i % 2 == 0) {
+                    d_list[i++] = new sphere(center, 1, new dielectric(1.5));
+                } else {
+                    d_list[i++] = new sphere(center, 1, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+                }
+            }
+        }
+        *rand_state = local_rand_state;
+        *d_world  = new hitable_list(d_list, num_objs);
+
+        vec3 lookfrom(0,0,20);
+        vec3 lookat(0,0,0.2);
+        float dist_to_focus = 10.0; (lookfrom-lookat).length();
+        float aperture = 0.1;
+        *d_camera   = new camera(lookfrom,
+                                 lookat,
+                                 vec3(0,1,0),
+                                 30.0,
+                                 float(nx)/float(ny),
+                                 aperture,
+                                 dist_to_focus);
+    }
+}
+
+// The goal of this world creation is to make a world that is completely load balanced.
+__global__ void create_world_unbalanced(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        curandState local_rand_state = *rand_state;
+        int i = 0;
+        int xtrans = -20;
+        int ytrans = -20;
+        int width = (int)sqrt((float)num_objs);
+        float xspace = 1;
+        float radius = xspace/2.0;
+
+        int num_layers = 2;
+
+        // MEtal layer.
+        for(int a = -width*xspace; a < width*xspace; a+=xspace) {
+            for(int b = -width/num_layers; b < width/num_layers; b+=xspace) {
+                float choose_mat = RND;
+                vec3 center(a + xtrans, b + ytrans, 0.2);
+                d_list[i++] = new sphere(center, radius, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+            }
+        }
+
+        // Dielectric layer
+        for(int a = -width*xspace; a < width*xspace; a+=xspace) {
+            for(int b = -width/num_layers; b < width/num_layers; b+=xspace) {
+                float choose_mat = RND;
+                vec3 center(a + xtrans, b + ytrans, 0.2 + 2*radius);
+                d_list[i++] = new sphere(center, xspace/2.0, new dielectric(1.5));
+            }
+        }
+        
+        *rand_state = local_rand_state;
+        *d_world  = new hitable_list(d_list, num_objs);
+
+        vec3 lookfrom(0,0,70);
+        vec3 lookat(0,0,0.2);
         float dist_to_focus = 10.0; (lookfrom-lookat).length();
         float aperture = 0.1;
         *d_camera   = new camera(lookfrom,
@@ -151,9 +239,9 @@ __global__ void move_cam(camera **d_camera, int steps = 1) {
     }
 }
 
-__global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera) {
+__global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera, int num_objs) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        for (int i = 0; i < num_hitables; i++) {
+        for (int i = 0; i < num_objs; i++) {
             delete ((sphere *)d_list[i])->mat_ptr;
             delete d_list[i];
         }
@@ -197,7 +285,7 @@ void write_frame_buffer_filename(vec3 *frame_buffer, int nx, int ny, int max_x, 
 }
 
 // Renders a single image and writes it to a ppm file.
-void test_render(int image_height, int image_width, int samples_per_pixel) {
+void test_render(int image_height, int image_width, int samples_per_pixel, int load_balancing_type) {
     int tx = 8;
     int ty = 8;
 
@@ -229,7 +317,13 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    if (load_balancing_type == NORMAL) {
+        create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+    } else if (load_balancing_type == UNBALANCED) {
+        create_world_unbalanced<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+    } else if (load_balancing_type == BALANCED) {
+        create_world_balanced<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+    }
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
@@ -253,7 +347,7 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
 
     // clean up
     checkCudaErrors(cudaDeviceSynchronize());
-    free_world<<<1,1>>>(d_list,d_world,d_camera);
+    free_world<<<1,1>>>(d_list,d_world,d_camera, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
@@ -265,7 +359,7 @@ void test_render(int image_height, int image_width, int samples_per_pixel) {
     cudaDeviceReset();
 }
 
-void benchmark_single(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
+void benchmark_single(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type) {
     int tx = 8;
     int ty = 8;
 
@@ -297,7 +391,13 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
     camera **d_camera;
     checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-    create_world<<<1,1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+    if (load_balancing_type == NORMAL) {
+        create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+    } else if (load_balancing_type == UNBALANCED) {
+        create_world_unbalanced<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+    } else if (load_balancing_type == BALANCED) {
+        create_world_balanced<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+    }
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
 
@@ -327,7 +427,7 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
 
     // clean up
     checkCudaErrors(cudaDeviceSynchronize());
-    free_world<<<1,1>>>(d_list,d_world,d_camera);
+    free_world<<<1,1>>>(d_list,d_world,d_camera, num_hitables);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaFree(d_camera));
     checkCudaErrors(cudaFree(d_world));
@@ -339,7 +439,7 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     cudaDeviceReset();
 }
 
-void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int num_gpus = -1) {
+void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type, int num_gpus = -1) {
     int tx = 8;
     int ty = 8;
 
@@ -389,7 +489,13 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
         checkCudaErrors(cudaMalloc((void **) &d_world[gpu_id], 1 * sizeof(hitable *)));
         checkCudaErrors(cudaMalloc((void **) &d_camera[gpu_id], 1 * sizeof(camera *)));
         cudaDeviceSynchronize();
-        create_world<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id], image_width, image_height, d_rand_state2[gpu_id]);
+        if (load_balancing_type == NORMAL) {
+            create_world<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id], image_width, image_height, d_rand_state2[gpu_id], num_hitables);
+        } else if (load_balancing_type == UNBALANCED) {
+            create_world_unbalanced<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id], image_width, image_height, d_rand_state2[gpu_id], num_hitables);
+        } else if (load_balancing_type == BALANCED) {
+            create_world_balanced<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id], image_width, image_height, d_rand_state2[gpu_id], num_hitables);
+        }
         checkCudaErrors(cudaGetLastError());
     }
 
@@ -430,7 +536,7 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     // clean up
     for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
         checkCudaErrors(cudaSetDevice(gpu_id));
-        free_world<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id]);
+        free_world<<<1, 1>>>(d_list[gpu_id], d_world[gpu_id], d_camera[gpu_id], num_hitables);
         checkCudaErrors(cudaGetLastError());
         checkCudaErrors(cudaFree(d_camera[gpu_id]));
         checkCudaErrors(cudaFree(d_world[gpu_id]));
@@ -469,7 +575,7 @@ enum message_tag {
     FRAME_BUFFER_BACK,
 };
 
-void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render) {
+void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type) {
     int num_procs, rank;
 
     MPI_Init(&argc, &argv);
@@ -519,7 +625,13 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hitable *)));
         checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
         checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
-        create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+        if (load_balancing_type == NORMAL) {
+            create_world<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+        } else if (load_balancing_type == UNBALANCED) {
+            create_world_unbalanced<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+        } else if (load_balancing_type == BALANCED) {
+            create_world_balanced<<<1, 1>>>(d_list, d_world, d_camera, image_width, image_height, d_rand_state2, num_hitables);
+        }
         checkCudaErrors(cudaGetLastError());
     }
 
@@ -530,8 +642,14 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     if (rank == 0) {
         //checkCudaErrors(cudaMallocManaged((void **)&camera_origins_for_frames, num_frames_to_render * sizeof(vec3)));
         camera_origins_for_frames = new vec3[num_frames_to_render];
-        auto origin = vec3(13, 2, 3);
-        init_camera_origins_for_frames(camera_origins_for_frames, num_frames_to_render, origin);
+        if (load_balancing_type == NORMAL) {
+            auto origin = vec3(13, 2, 3);
+            init_camera_origins_for_frames(camera_origins_for_frames, num_frames_to_render, origin);
+        } else if (load_balancing_type == UNBALANCED) {
+            auto origin = vec3(0,0,70);
+        } else if (load_balancing_type == BALANCED) {
+            auto origin = vec3(0,0,20);
+        }
     }
 
     clock_t start, stop;
@@ -660,7 +778,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     // }
     if (rank > 0) {
         checkCudaErrors(cudaFree(frame_buffer));
-        free_world<<<1, 1>>>(d_list, d_world, d_camera);
+        free_world<<<1, 1>>>(d_list, d_world, d_camera, num_hitables);
         checkCudaErrors(cudaFree(d_camera));
         checkCudaErrors(cudaFree(d_world));
         checkCudaErrors(cudaFree(d_list));
@@ -673,13 +791,13 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
 }
 
 // Benchmarks the throughput of a rendering type.
-void benchmark_rendering(int argc, char **argv, std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus) {
+void benchmark_rendering(int argc, char **argv, std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus, int load_balancing_type) {
     if (strcmp(rendering_strategy.c_str(), "singlenode") == 0) {
-        benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render);
+        benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type);
     } else if (strcmp(rendering_strategy.c_str(), "tiled") == 0) {
-        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
+        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type, requested_gpus);
     } else if (strcmp(rendering_strategy.c_str(), "frame") == 0) {
-        benchmark_frame(argc, argv, image_height, image_width, samples_per_pixel, num_frames_to_render);
+        benchmark_frame(argc, argv, image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type);
     }
 }
 
@@ -695,6 +813,7 @@ int main(int argc, char **argv) {
         std::cout << "-s <int>: number of samples per pixel" << std::endl;
         std::cout << "-f <int>: number of frames to render" << std::endl;
         std::cout << "-g <int>: number of gpus to use" << std::endl;
+        std::cout << "-l <int>: load balancing type, 0 = normal scene, 1 = unbalanced, 2 = perfectly balanced as all things should be" << std::endl;
         return 0;
     }
 
@@ -702,9 +821,16 @@ int main(int argc, char **argv) {
     int image_width = find_int_arg(argc, argv, "-w", 1200);
     int samples_per_pixel = find_int_arg(argc, argv, "-s", 10);
 
+    int load_balancing_type = find_int_arg(argc, argv, "-l", 0);
+    if (load_balancing_type == 0) {
+        num_hitables = (22*22 + 1 + 3);
+    } else {
+        num_hitables = 22*22;
+    }
+
     int type = find_int_arg(argc, argv, "-t", 0);
     if (type == 0) {
-        test_render(image_height, image_width, samples_per_pixel);
+        test_render(image_height, image_width, samples_per_pixel, load_balancing_type);
         return 0;
     }
 
@@ -717,5 +843,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    benchmark_rendering(argc, argv, rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus);
+
+    benchmark_rendering(argc, argv, rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus, load_balancing_type);
 }
