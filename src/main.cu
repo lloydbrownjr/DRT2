@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <unistd.h>
 
 #include <curand_kernel.h>
 #include <mpi.h>
@@ -79,8 +80,10 @@ __global__ void render_init_tiled(int x_range, int y_range, curandState *rand_st
     curand_init(1984+pixel_index, 0, 0, &rand_state[pixel_index]);
 }
 
+#define RND (curand_uniform(&local_rand_state))
+
 __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_height, int x_start, int y_start, int x_range, int y_range,
-        int number_samples, camera **cam, hitable **world, curandState *rand_state) {
+        int number_samples, camera **cam, hitable **world, curandState *rand_state, int straggler = 0) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if (i >= x_range || j >= y_range) {
@@ -101,9 +104,18 @@ __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_heig
     rand_state[local_index] = local_rand_state;
     col /= float(number_samples);
     frame_buffer[pixel_index] = col.getsqrt();
+    if (straggler == 1) {
+        if (RND > 0.5 == 0) {
+            clock_t start_clock = clock();
+            clock_t clock_offset = 0;
+            clock_t clock_count = 2.19 * pow(10, 9) * 2; // in clock cycles with 2.19 * 10^9 Hz, 2 sec delay
+            while (clock_offset < clock_count)
+            {
+                clock_offset = clock() - start_clock;
+            }
+        }
+    }
 }
-
-#define RND (curand_uniform(&local_rand_state))
 
 __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -359,7 +371,7 @@ void test_render(int image_height, int image_width, int samples_per_pixel, int l
     cudaDeviceReset();
 }
 
-void benchmark_single(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type) {
+void benchmark_single(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type, int straggler) {
     int tx = 8;
     int ty = 8;
 
@@ -439,7 +451,7 @@ void benchmark_single(int image_height, int image_width, int samples_per_pixel, 
     cudaDeviceReset();
 }
 
-void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type, int num_gpus = -1) {
+void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type, int num_gpus = -1, int straggler = 0) {
     int tx = 8;
     int ty = 8;
 
@@ -514,8 +526,12 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
         for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
             checkCudaErrors(cudaSetDevice(gpu_id));
             int x_start = 0, y_start = image_height * gpu_id / num_gpus;
+            int make_straggler = 0;
+            if (straggler == 1 && num_gpus > 1 && gpu_id == 1) {
+                make_straggler = 1;
+            }
             render_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(frame_buffer, image_width, image_height, x_start, y_start, per_gpu_width, per_gpu_height,
-                samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id]);
+                samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id], make_straggler);
             checkCudaErrors(cudaGetLastError());
             move_cam<<<1, 1, 0, streams[gpu_id]>>>(d_camera[gpu_id]);
             checkCudaErrors(cudaGetLastError());
@@ -573,9 +589,10 @@ enum message_tag {
     KILL_SIGNAL,
     CAMERA_ORIGIN_INFO,
     FRAME_BUFFER_BACK,
+    STOP_WORK_SIGNAL,
 };
 
-void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type) {
+void benchmark_frame(int argc, char **argv, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int load_balancing_type, int straggler) {
     int num_procs, rank;
 
     MPI_Init(&argc, &argv);
@@ -668,10 +685,10 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaGetLastError());
 
     if (rank == 0) {
-        std::unordered_set<int> free_gpus;
+        std::vector<int> free_gpus;
         std::vector<int> remaining_frames;
         for (int i = 1; i < num_procs; i++) {
-            free_gpus.insert(i);
+            free_gpus.push_back(i);
         }
         for (int i = 0; i < num_frames_to_render; i++) {
             remaining_frames.push_back(i);
@@ -679,6 +696,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
 
         std::map<int, int> work_assignment; // gpu_id -> frame_id, ordered on gpu_id.
         // only those in progress are in the work_assignment map.
+        std::map<int, clock_t> work_assignment_time;
         // std::unordered_map<int, MPI_Request> work_requests; // gpu_id -> Request
         MPI_Request work_requests[num_procs-1];
         for (int i = 0; i < num_procs-1; i++) {
@@ -709,13 +727,27 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                 break;
             }
 
+            if (free_gpus.size() > 0) {
+                for(int gpu_id = 0; gpu_id < num_procs - 1; gpu_id++) {
+                    if (work_assignment_time.find(gpu_id) != work_assignment_time.end() // gpu is assigned something
+                        && clock() - work_assignment_time[gpu_id] > 1.29 * pow(10, 9) * 2) { // over 2s means straggler
+                        int frame_id = work_assignment[gpu_id];
+                        remaining_frames.insert(remaining_frames.begin(), frame_id); // put frame at front of queue
+                        work_assignment_time.erase(gpu_id); // dont look at this straggler gpu again
+                        break;
+                    }
+                }
+            }
+
             if (remaining_frames.size() == 0 || free_gpus.size() == 0) {
                 MPI_Waitany(num_procs-1, work_requests, &index, &status);
                 int gpu_id = index + 1;
-                free_gpus.insert(gpu_id);
+                free_gpus.push_back(gpu_id);
                 // Remove the gpu from the frame to gpu map.
                 int frame_id = work_assignment[gpu_id];
                 work_assignment.erase(gpu_id);
+                if  (work_assignment_time.find(gpu_id) != work_assignment_time.end())
+                    work_assignment_time.erase(gpu_id);
                 work_requests[gpu_id - 1] = MPI_REQUEST_NULL;
                 if (remaining_frames.size() == 0) {
                     continue;
@@ -729,6 +761,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             int gpu = *gpu_it;
             free_gpus.erase(gpu_it);
             work_assignment[gpu] = frame;
+            work_assignment_time[gpu] = clock();
             // pop a frame
             // pop a gpu
             vec3 camera_origin = camera_origins_for_frames[frame];
@@ -757,11 +790,19 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             // get camera origin info
             update_camera_origin<<<1, 1>>>(camera_origin, d_camera);
             // update d_camera
+            int make_straggler = 0;
+            if (straggler == 1 && rank == 1 && num_procs > 2) {
+                make_straggler = 1;
+            }
             render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, 0, image_width, image_height,
-                samples_per_pixel, d_camera, d_world, d_rand_state);
+                samples_per_pixel, d_camera, d_world, d_rand_state, make_straggler);
             // render
             // send back frame
             checkCudaErrors(cudaDeviceSynchronize());
+            // if (straggler == 1) {
+            //     if (rand() % 2 == 0)
+            //         sleep(5); // sleep 5 secs
+            // }
             MPI_Send(frame_buffer, num_pixels, MPI_Vec3, 0, FRAME_BUFFER_BACK, MPI_COMM_WORLD);
         }
     }
@@ -791,13 +832,13 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
 }
 
 // Benchmarks the throughput of a rendering type.
-void benchmark_rendering(int argc, char **argv, std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus, int load_balancing_type) {
+void benchmark_rendering(int argc, char **argv, std::string rendering_strategy, int image_height, int image_width, int samples_per_pixel, int num_frames_to_render, int requested_gpus, int load_balancing_type, int straggler) {
     if (strcmp(rendering_strategy.c_str(), "singlenode") == 0) {
-        benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type);
+        benchmark_single(image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type, straggler);
     } else if (strcmp(rendering_strategy.c_str(), "tiled") == 0) {
-        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type, requested_gpus);
+        benchmark_tiled(image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type, requested_gpus, straggler);
     } else if (strcmp(rendering_strategy.c_str(), "frame") == 0) {
-        benchmark_frame(argc, argv, image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type);
+        benchmark_frame(argc, argv, image_height, image_width, samples_per_pixel, num_frames_to_render, load_balancing_type, straggler);
     }
 }
 
@@ -814,6 +855,7 @@ int main(int argc, char **argv) {
         std::cout << "-f <int>: number of frames to render" << std::endl;
         std::cout << "-g <int>: number of gpus to use" << std::endl;
         std::cout << "-l <int>: load balancing type, 0 = normal scene, 1 = unbalanced, 2 = perfectly balanced as all things should be" << std::endl;
+        std::cout << "-z <int>: 0 = no straggler, 1 = one straggler" << std::endl;
         return 0;
     }
 
@@ -836,6 +878,7 @@ int main(int argc, char **argv) {
 
     int num_frames_to_render = find_int_arg(argc, argv, "-f", 30);
     int requested_gpus = find_int_arg(argc, argv, "-g", -1);
+    int straggler = find_int_arg(argc, argv, "-z", 0);
 
     std::string rendering_strategy = find_string_option(argc, argv, "-r", std::string("singlenode"));
     if (strcmp(rendering_strategy.c_str(), "singlenode") != 0  && strcmp(rendering_strategy.c_str(), "tiled") != 0 && strcmp(rendering_strategy.c_str(), "frame") != 0) {
@@ -844,5 +887,5 @@ int main(int argc, char **argv) {
     }
 
 
-    benchmark_rendering(argc, argv, rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus, load_balancing_type);
+    benchmark_rendering(argc, argv, rendering_strategy, image_height, image_width, samples_per_pixel, num_frames_to_render, requested_gpus, load_balancing_type, straggler);
 }
