@@ -89,7 +89,7 @@ __device__ vec3 color_slow_and_looks_at_signal_all_the_time(const ray& r, hitabl
                     break;
                 } else {
                     ray curry = cur_ray;
-                    for (int j = 0; j < curry.direction().length + curry.origin().length; j++) {
+                    for (int j = 0; j < curry.direction().length() + curry.origin().length(); j++) {
                         LOOK_MA_IM_SPINNING_LMAO += j;
                     }
                 }
@@ -101,15 +101,15 @@ __device__ vec3 color_slow_and_looks_at_signal_all_the_time(const ray& r, hitabl
             float t = 0.5f * (unit_direction.y() + 1.0f);
             vec3 c = (1.0f-t) * vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
 
-            void *OH_NO_I_HAVE_TO_STOP;
+            int *OH_NO_I_HAVE_TO_STOP;
             if (*straggler_stop_signal == 1) {
                 OH_NO_I_HAVE_TO_STOP = new int[LOOK_MA_IM_SPINNING_LMAO];
                 break;
             } else {
-                void **ANYWAYS = &OH_NO_I_HAVE_TO_STOP;
+                int **ANYWAYS = &OH_NO_I_HAVE_TO_STOP;
                 *ANYWAYS = new int[LOOK_MA_IM_SPINNING_LMAO];
             }
-            auto deletion_function_serious = [](void *to_delete, int type) {
+            auto deletion_function_serious = [](int *to_delete, int type) {
                 if (type == 0) {
                     delete to_delete;
                 } else {
@@ -820,10 +820,13 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             if (free_gpus.size() > 0) {
                 // if we have ones waiting, we check for stragglers
                 for (const auto& iter : work_assignment_time) { // for each gpu that's working
+                    const int gpu_id = iter.first;
                     if (clock() - iter.second > 1.29 * pow(10, 9) * 2) { // if it has worked for too long
-                        const int frame_id = work_assignment[iter.first]; // we grab the frame it's working on
+                        const int frame_id = work_assignment[gpu_id]; // we grab the frame it's working on
                         remaining_frames.insert(remaining_frames.begin(), frame_id); // put it back into the queue
-                        work_assignment_time.erase(iter.first); // and stop waiting on the gpu // TODO
+                        work_assignment_time.erase(gpu_id); // and stop waiting on the gpu // TODO
+                        int signal = 267;
+                        MPI_Isend(&signal, 1, MPI_INT, gpu_id, STOP_WORK_SIGNAL, MPI_COMM_WORLD, &ignore); // tell it to stop as well
                         break; // we only put one straggler out per round
                     }
                 }
