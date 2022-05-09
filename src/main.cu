@@ -817,11 +817,11 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                 break;
             }
 
-            if (free_gpus.size() > 0) {
+            if (straggler == 1 && free_gpus.size() > 0) {
                 // if we have ones waiting, we check for stragglers
                 for (const auto& iter : work_assignment_time) { // for each gpu that's working
                     const int gpu_id = iter.first;
-                    if (clock() - iter.second > 1.29 * pow(10, 9) * 2) { // if it has worked for too long
+                    if (clock() - iter.second > 1.29 * pow(10, 9) * 5) { // if it has worked for too long
                         const int frame_id = work_assignment[gpu_id]; // we grab the frame it's working on
                         remaining_frames.insert(remaining_frames.begin(), frame_id); // put it back into the queue
                         work_assignment_time.erase(gpu_id); // and stop waiting on the gpu // TODO
@@ -851,7 +851,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                 int frame_id = work_assignment[gpu_id];
                 work_assignment.erase(gpu_id);
                 if (work_assignment_time.find(gpu_id) != work_assignment_time.end()) {
-                    std::cerr << "work assignment_time is not found" << std::endl;
+                    // std::cerr << "work assignment_time is not found" << std::endl;
                     work_assignment_time.erase(gpu_id);
                 }
                 work_requests[index] = MPI_REQUEST_NULL;
@@ -894,7 +894,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
         
         while (true) {
             MPI_Irecv(camera_origin.e, 1, MPI_Vec3, 0, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &requests[2]);
-            MPI_Waitany(2, requests, &which_request, MPI_STATUS_IGNORE);
+            MPI_Waitany(3, requests, &which_request, MPI_STATUS_IGNORE);
             if (which_request == 0) {
                 // KILL signal received
                 if (signal == 267) {
@@ -914,7 +914,7 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
                 make_straggler = 1;
             }
             render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, 0, image_width, image_height,
-                samples_per_pixel, d_camera, d_world, d_rand_state, make_straggler);
+                samples_per_pixel, d_camera, d_world, d_rand_state, make_straggler, straggler_stop_signal_gpu);
             // render
             // send back frame
             checkCudaErrors(cudaDeviceSynchronize());
