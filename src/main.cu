@@ -58,6 +58,80 @@ __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_sta
     return vec3(0.0, 0.0, 0.0); // exceeded recursion
 }
 
+__device__ vec3 color_slow_and_looks_at_signal_all_the_time(const ray& r, hitable **world, curandState *local_rand_state,
+        const int *straggler_stop_signal) {
+    ray cur_ray = r;
+    vec3 cur_attenuation = vec3(1.0,1.0,1.0);
+    int LOOK_MA_IM_SPINNING_LMAO = 0;
+    for (int i = 0; i < 50; i++) {
+        if (*straggler_stop_signal == 1) {
+            break;
+        } else {
+            for (int j = 0; j < cur_attenuation.length(); j++) {
+                LOOK_MA_IM_SPINNING_LMAO += j;
+            }
+        }
+        hit_record rec;
+        if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
+            if (*straggler_stop_signal == 1) {
+                break;
+            } else {
+                for (int j = 0; j < rec.t; j++) {
+                    LOOK_MA_IM_SPINNING_LMAO += j;
+                }
+            }
+            ray scattered;
+            vec3 attenuation;
+            if (rec.mat_ptr->scatter(cur_ray, rec, attenuation, scattered, local_rand_state)) {
+                cur_attenuation *= attenuation;
+                cur_ray = scattered;
+                if (*straggler_stop_signal == 1) {
+                    break;
+                } else {
+                    ray curry = cur_ray;
+                    for (int j = 0; j < curry.direction().length + curry.origin().length; j++) {
+                        LOOK_MA_IM_SPINNING_LMAO += j;
+                    }
+                }
+            } else {
+                return vec3(0, 0, 0);
+            }
+        } else {
+            vec3 unit_direction = unit_vector(cur_ray.direction());
+            float t = 0.5f * (unit_direction.y() + 1.0f);
+            vec3 c = (1.0f-t) * vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
+
+            void *OH_NO_I_HAVE_TO_STOP;
+            if (*straggler_stop_signal == 1) {
+                OH_NO_I_HAVE_TO_STOP = new int[LOOK_MA_IM_SPINNING_LMAO];
+                break;
+            } else {
+                void **ANYWAYS = &OH_NO_I_HAVE_TO_STOP;
+                *ANYWAYS = new int[LOOK_MA_IM_SPINNING_LMAO];
+            }
+            auto deletion_function_serious = [](void *to_delete, int type) {
+                if (type == 0) {
+                    delete to_delete;
+                } else {
+                    delete[] to_delete;
+                }
+            };
+            deletion_function_serious(OH_NO_I_HAVE_TO_STOP, 1);
+            
+            return cur_attenuation * c;
+        }
+
+        if (*straggler_stop_signal == 1) {
+            break;
+        } else {
+            for (int j = 0; j < 10000; j++) {
+                LOOK_MA_IM_SPINNING_LMAO += j;
+            }
+        }
+    }
+    return vec3(0.0, 0.0, 0.0); // exceeded recursion
+}
+
 __global__ void rand_init(curandState *rand_state) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         curand_init(1984, 0, 0, rand_state);
@@ -83,7 +157,8 @@ __global__ void render_init_tiled(int x_range, int y_range, curandState *rand_st
 #define RND (curand_uniform(&local_rand_state))
 
 __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_height, int x_start, int y_start, int x_range, int y_range,
-        int number_samples, camera **cam, hitable **world, curandState *rand_state, int straggler = 0) {
+        int number_samples, camera **cam, hitable **world, curandState *rand_state,
+        int straggler = 0, int *straggler_stop_signal = NULL) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
     if (i >= x_range || j >= y_range) {
@@ -95,26 +170,38 @@ __global__ void render_tiled(vec3 *frame_buffer, int image_width, int image_heig
     int pixel_y = y_start + j;
     int pixel_index = pixel_y * image_width + pixel_x;
     vec3 col(0, 0, 0);
-    for(int sample = 0; sample < number_samples; sample++) {
-        float u = float(pixel_x + curand_uniform(&local_rand_state)) / float(image_width);
-        float v = float(pixel_y + curand_uniform(&local_rand_state)) / float(image_height);
-        ray r = (*cam)->get_ray(u, v, &local_rand_state);
-        col += color(r, world, &local_rand_state);
+    if (straggler == 1 && straggler_stop_signal != NULL) {
+        for (int sample = 0; sample < number_samples; sample++) {
+            float u = float(pixel_x + curand_uniform(&local_rand_state)) / float(image_width);
+            float v = float(pixel_y + curand_uniform(&local_rand_state)) / float(image_height);
+            ray r = (*cam)->get_ray(u, v, &local_rand_state);
+            col += color_slow_and_looks_at_signal_all_the_time(r, world, &local_rand_state, straggler_stop_signal);
+            if (*straggler_stop_signal == 1) {
+                break;
+            }
+        }
+    } else {
+        for (int sample = 0; sample < number_samples; sample++) {
+            float u = float(pixel_x + curand_uniform(&local_rand_state)) / float(image_width);
+            float v = float(pixel_y + curand_uniform(&local_rand_state)) / float(image_height);
+            ray r = (*cam)->get_ray(u, v, &local_rand_state);
+            col += color(r, world, &local_rand_state);
+        }
     }
     rand_state[local_index] = local_rand_state;
     col /= float(number_samples);
     frame_buffer[pixel_index] = col.getsqrt();
-    if (straggler == 1) {
-        if (RND > 0.5 == 0) {
-            clock_t start_clock = clock();
-            clock_t clock_offset = 0;
-            clock_t clock_count = 2.19 * pow(10, 9) * 2; // in clock cycles with 2.19 * 10^9 Hz, 2 sec delay
-            while (clock_offset < clock_count)
-            {
-                clock_offset = clock() - start_clock;
-            }
-        }
-    }
+    // if (straggler == 1) {
+    //     if (RND > 0.5 == 0) {
+    //         clock_t start_clock = clock();
+    //         clock_t clock_offset = 0;
+    //         clock_t clock_count = 2.19 * pow(10, 9) * 2; // in clock cycles with 2.19 * 10^9 Hz, 2 sec delay
+    //         while (clock_offset < clock_count)
+    //         {
+    //             clock_offset = clock() - start_clock;
+    //         }
+    //     }
+    // }
 }
 
 __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state, int num_objs) {
@@ -522,6 +609,8 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
     for (int stream_id = 0; stream_id < num_streams; stream_id++) {
         checkCudaErrors(cudaStreamSynchronize(streams[stream_id]));
     }
+    int *straggler_stop_signal = NULL;
+    checkCudaErrors(cudaMallocManaged((void **) &straggler_stop_signal, sizeof(int)));
     for (int i = 0; i < num_frames_to_render; i++) {
         for (int gpu_id = 0; gpu_id < num_gpus; gpu_id++) {
             checkCudaErrors(cudaSetDevice(gpu_id));
@@ -531,7 +620,7 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
                 make_straggler = 1;
             }
             render_tiled<<<blocks, threads, 0, streams[gpu_id]>>>(frame_buffer, image_width, image_height, x_start, y_start, per_gpu_width, per_gpu_height,
-                samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id], make_straggler);
+                samples_per_pixel, d_camera[gpu_id], d_world[gpu_id], d_rand_state[gpu_id], make_straggler, straggler_stop_signal);
             checkCudaErrors(cudaGetLastError());
             move_cam<<<1, 1, 0, streams[gpu_id]>>>(d_camera[gpu_id]);
             checkCudaErrors(cudaGetLastError());
@@ -540,6 +629,7 @@ void benchmark_tiled(int image_height, int image_width, int samples_per_pixel, i
             checkCudaErrors(cudaStreamSynchronize(streams[gpu_id]));
         }
     }
+    checkCudaErrors(cudaFree(straggler_stop_signal));
 
     stop = clock();
     double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
@@ -728,27 +818,41 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             }
 
             if (free_gpus.size() > 0) {
-                for(int gpu_id = 0; gpu_id < num_procs - 1; gpu_id++) {
-                    if (work_assignment_time.find(gpu_id) != work_assignment_time.end() // gpu is assigned something
-                        && clock() - work_assignment_time[gpu_id] > 1.29 * pow(10, 9) * 2) { // over 2s means straggler
-                        int frame_id = work_assignment[gpu_id];
-                        remaining_frames.insert(remaining_frames.begin(), frame_id); // put frame at front of queue
-                        work_assignment_time.erase(gpu_id); // dont look at this straggler gpu again
-                        break;
+                // if we have ones waiting, we check for stragglers
+                for (const auto& iter : work_assignment_time) { // for each gpu that's working
+                    if (clock() - iter.second > 1.29 * pow(10, 9) * 2) { // if it has worked for too long
+                        const int frame_id = work_assignment[iter.first]; // we grab the frame it's working on
+                        remaining_frames.insert(remaining_frames.begin(), frame_id); // put it back into the queue
+                        work_assignment_time.erase(iter.first); // and stop waiting on the gpu // TODO
+                        break; // we only put one straggler out per round
                     }
                 }
+
+                // for (int gpu_id = 0; gpu_id < num_procs - 1; gpu_id++) {
+                //     if (work_assignment_time.find(gpu_id) != work_assignment_time.end() // gpu is assigned something
+                //             && clock() - work_assignment_time[gpu_id] > 1.29 * pow(10, 9) * 2) { // over 2s means straggler
+                //         int frame_id = work_assignment[gpu_id];
+                //         remaining_frames.insert(remaining_frames.begin(), frame_id); // put frame at front of queue
+                //         work_assignment_time.erase(gpu_id); // dont look at this straggler gpu again
+                //         break;
+                //     }
+                // }
             }
 
             if (remaining_frames.size() == 0 || free_gpus.size() == 0) {
+                // if no work is to be done or no worker is available, we wait
                 MPI_Waitany(num_procs-1, work_requests, &index, &status);
                 int gpu_id = index + 1;
                 free_gpus.push_back(gpu_id);
                 // Remove the gpu from the frame to gpu map.
                 int frame_id = work_assignment[gpu_id];
                 work_assignment.erase(gpu_id);
-                if  (work_assignment_time.find(gpu_id) != work_assignment_time.end())
+                if (work_assignment_time.find(gpu_id) != work_assignment_time.end()) {
+                    std::cerr << "work assignment_time is not found" << std::endl;
                     work_assignment_time.erase(gpu_id);
-                work_requests[gpu_id - 1] = MPI_REQUEST_NULL;
+                }
+                work_requests[index] = MPI_REQUEST_NULL;
+
                 if (remaining_frames.size() == 0) {
                     continue;
                 }
@@ -757,9 +861,11 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             auto frame_iter = remaining_frames.begin();
             int frame = *frame_iter;
             remaining_frames.erase(frame_iter);
-            auto gpu_it = free_gpus.begin();
-            int gpu = *gpu_it;
-            free_gpus.erase(gpu_it);
+            // auto gpu_it = free_gpus.begin();
+            // int gpu = *gpu_it;
+            int gpu = free_gpus.front();
+            free_gpus.erase(free_gpus.begin());
+
             work_assignment[gpu] = frame;
             work_assignment_time[gpu] = clock();
             // pop a frame
@@ -774,17 +880,27 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     } else {
         vec3 camera_origin;
         int signal;
-        MPI_Request requests[2];
+        MPI_Request requests[3];
         MPI_Irecv(&signal, 1, MPI_INT, 0, KILL_SIGNAL, MPI_COMM_WORLD, &requests[0]);
+        MPI_Irecv(&signal, 1, MPI_INT, 0, STOP_WORK_SIGNAL, MPI_COMM_WORLD, &requests[1]);
         int which_request;
-        MPI_Status status;
+
+        int *straggler_stop_signal_gpu;
+        checkCudaErrors(cudaMallocManaged((void **) &straggler_stop_signal_gpu, sizeof(int)));
+        *straggler_stop_signal_gpu = 0;
+        
         while (true) {
-            MPI_Irecv(camera_origin.e, 1, MPI_Vec3, 0, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &requests[1]);
-            MPI_Waitany(2, requests, &which_request, &status);
+            MPI_Irecv(camera_origin.e, 1, MPI_Vec3, 0, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &requests[2]);
+            MPI_Waitany(2, requests, &which_request, MPI_STATUS_IGNORE);
             if (which_request == 0) {
-                // signal received
+                // KILL signal received
                 if (signal == 267) {
                     break;
+                }
+            } else if (which_request == 1) {
+                // STOP_WORK signal received
+                if (signal == 267) {
+                    *straggler_stop_signal_gpu = 1;
                 }
             }
             // get camera origin info
