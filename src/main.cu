@@ -4,6 +4,7 @@
 #include <string>
 #include <time.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <curand_kernel.h>
@@ -164,6 +165,23 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
 // Writes the image to a ppm file.
 void write_frame_buffer(vec3 *frame_buffer, int nx, int ny, int max_x, int max_y) {
     FILE *f = fopen("output.ppm", "w");
+    fprintf(f, "P3\n%d %d\n255\n", max_x, max_y);
+    for(int j = 0; j < max_y; j++) {
+        for(int i = 0; i < max_x; i++) {
+            vec3 col = frame_buffer[j*max_x + i];
+            int ir = int(255.99 * col[0]);
+            int ig = int(255.99 * col[1]);
+            int ib = int(255.99 * col[2]);
+            fprintf(f, "%d %d %d ", ir, ig, ib);
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
+// Writes the image to a ppm file.
+void write_frame_buffer_filename(vec3 *frame_buffer, int nx, int ny, int max_x, int max_y, std::string filename) {
+    FILE *f = fopen(filename.c_str(), "w");
     fprintf(f, "P3\n%d %d\n255\n", max_x, max_y);
     for(int j = 0; j < max_y; j++) {
         for(int i = 0; i < max_x; i++) {
@@ -440,9 +458,9 @@ __global__ void init_camera_origins_for_frames(vec3 *camera_origins_for_frames, 
     camera_origins_for_frames[0] = vec3(current_origin);
     for (int i = 1; i < num_frames_to_render; i++) {
         // Each subsequent frame is offset by the move vector.
-        camera_origins_for_frames[i].e[0] = camera_origins_for_frames[i-1].x() + move_vector.x();
-        camera_origins_for_frames[i].e[1] = camera_origins_for_frames[i-1].y() + move_vector.y();
-        camera_origins_for_frames[i].e[2] = camera_origins_for_frames[i-1].z() + move_vector.z();
+        camera_origins_for_frames[i].e[0] = camera_origins_for_frames[i-1].x();
+        camera_origins_for_frames[i].e[1] = camera_origins_for_frames[i-1].y();
+        camera_origins_for_frames[i].e[2] = camera_origins_for_frames[i-1].z();
     }
 }
 
@@ -517,18 +535,26 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
     checkCudaErrors(cudaGetLastError());
 
     if (rank == 0) {
-        std::vector<int> free_gpus;
+        std::unordered_set<int> free_gpus;
         std::vector<int> remaining_frames;
         for (int i = 0; i < num_procs; i++) {
-            free_gpus.push_back(i);
+            free_gpus.insert(i);
         }
         for (int i = 0; i < num_frames_to_render; i++) {
             remaining_frames.push_back(i);
         }
 
         std::map<int, int> work_assignment; // frame_id -> gpu_id, ordered on frame_id.
+        std::map<int, int> work_assignment_gpu_to_frame; // frame_id -> gpu_id, ordered on frame_id.
         // only those in progress are in the work_assignment map.
-        std::unordered_map<int, MPI_Request> work_requests; // gpu_id -> Request
+        // std::unordered_map<int, MPI_Request> work_requests; // gpu_id -> Request
+        MPI_Request work_requests[num_procs-1];
+        for (int i = 0; i < num_procs-1; i++) {
+            work_requests[i] = MPI_REQUEST_NULL;
+        }
+        MPI_Status status;
+        int index;
+
 
         vec3 **recv_frame_buffer = new vec3 *[num_procs];
         for (int i = 1; i < num_procs; i++) {
@@ -552,21 +578,14 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             }
 
             if (remaining_frames.size() == 0 || free_gpus.size() == 0) {
-                // nothing to dispatch, so we wait for incoming stuff
-                // grab information for the first pending frame;
-                int first_frame_in_work = work_assignment.begin()->first;
-                int gpu_for_that = work_assignment[first_frame_in_work];
-
-                if (gpu_for_that == rank) {
-                    checkCudaErrors(cudaDeviceSynchronize());
-                    // data is ready in frame_buffer
-                } else {
-                    MPI_Status status;
-                    MPI_Wait(&work_requests[gpu_for_that], &status);
-                    // data is ready in recv_frame_buffer[gpu_for_that]
-                }
-                work_assignment.erase(first_frame_in_work);
-                free_gpus.push_back(gpu_for_that);
+                MPI_Waitany(num_procs-1, work_requests, &index, &status);
+                int gpu_id = index + 1;
+                free_gpus.insert(gpu_id);
+                // Remove the gpu from the frame to gpu map.
+                int frame_id = work_assignment_gpu_to_frame[gpu_id];
+                work_assignment_gpu_to_frame.erase(gpu_id);
+                work_assignment.erase(frame_id);
+                work_requests[gpu_id - 1] = MPI_REQUEST_NULL;
                 if (remaining_frames.size() == 0) {
                     continue;
                 }
@@ -575,23 +594,30 @@ void benchmark_frame(int argc, char **argv, int image_height, int image_width, i
             auto frame_iter = remaining_frames.begin();
             int frame = *frame_iter;
             remaining_frames.erase(frame_iter);
-            int gpu = free_gpus.back();
-            free_gpus.pop_back();
+            auto gpu_it = free_gpus.begin();
+            int gpu = *gpu_it;
+            free_gpus.erase(gpu_it);
             work_assignment[frame] = gpu;
+            work_assignment_gpu_to_frame[gpu] = frame;
             // pop a frame
             // pop a gpu
             vec3 camera_origin = camera_origins_for_frames[frame];
             if (gpu == rank) {
+                checkCudaErrors(cudaDeviceSynchronize());
                 // camera holds camera_origin info
                 update_camera_origin<<<1, 1>>>(camera_origin, d_camera);
                 // update d_camera
                 render_tiled<<<blocks, threads>>>(frame_buffer, image_width, image_height, 0, 0, image_width, image_height,
                     samples_per_pixel, d_camera, d_world, d_rand_state);
                 // render<<<>>>
+                free_gpus.insert(gpu);
+                work_assignment_gpu_to_frame.erase(gpu);
+                work_assignment.erase(frame);
+                //write_frame_buffer_filename(frame_buffer, image_width, image_height, image_width, image_height, std::string("output/output_") + std::to_string(frame) + std::string(".ppm"));
             } else {
                 MPI_Isend(camera_origin.e, 1, MPI_Vec3, gpu, CAMERA_ORIGIN_INFO, MPI_COMM_WORLD, &ignore);
                 // send camera to remote gpu
-                MPI_Irecv(recv_frame_buffer[gpu], num_pixels, MPI_Vec3, gpu, FRAME_BUFFER_BACK, MPI_COMM_WORLD, &work_requests[gpu]);
+                MPI_Irecv(recv_frame_buffer[gpu], num_pixels, MPI_Vec3, gpu, FRAME_BUFFER_BACK, MPI_COMM_WORLD, &work_requests[gpu-1]);
                 // recv into corresponding frame_buffer
             }
 
